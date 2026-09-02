@@ -1,24 +1,32 @@
 import hashlib
 import json
 import os
-import shutil
-import stat
-import subprocess
 import tempfile
 import time
+import uuid
 from datetime import datetime
-from pathlib import Path
 
-from . import github
-from .anchor import locate_in_diff, parse_anchorable
-from .grounding import counts as grounding_counts
-from .grounding import ground
-from .loop import run, system_prompt
-from .models import Finding, PublishedFinding, ReviewFindings, ReviewResult
+from langgraph.checkpoint.sqlite import SqliteSaver
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DIFF_CAP = 400 * 1024
-TOO_LARGE = "Diff too large to review."
+from pydantic import ValidationError
+
+from config import ROOT, get_settings
+from core.models import PublishedFinding, ReviewResult
+from gh import (
+    build_review,
+    clone_head,
+    get_diff,
+    get_pr,
+    post_review,
+    rmtree,
+    too_large_payload,
+)
+from .graph import RECURSION_LIMIT, build_graph
+from .graph_state import ReviewState
+from .nodes import system_prompt
+from .runtime import run_id_var, trace_holder
+
+PROJECT_ROOT = ROOT
 
 
 def review_pr(
@@ -28,265 +36,185 @@ def review_pr(
     token: str,
     dry_run: bool = False,
 ) -> ReviewResult:
+    settings = get_settings()
     pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
     t0 = time.monotonic()
-    tmp: str | None = None
-    model = os.environ.get("ANTHROPIC_MODEL") or os.environ.get("MODEL", "claude-sonnet-4-20250514")
-    prompt_sha = hashlib.sha256(system_prompt().encode()).hexdigest()
-    done: dict | None = None
     try:
-        meta = github.get_pr(owner, repo, number, token)
+        run_id = run_id_var.get()
+    except LookupError:
+        run_id = str(uuid.uuid4())
+    trace: list = []
+    trace_tok = trace_holder.set(trace)
+    tmp: str | None = None
+    result: ReviewResult | None = None
+    try:
+        meta = get_pr(owner, repo, number, token)
         head_sha = meta["head"]["sha"]
-        diff = github.get_diff(owner, repo, number, token)
-        if len(diff.encode("utf-8")) > DIFF_CAP:
-            done = dict(
+        diff = get_diff(owner, repo, number, token)
+        if len(diff.encode("utf-8")) > settings.max_diff_bytes:
+            payload = too_large_payload(head_sha)
+            posted = False
+            if not dry_run:
+                post_review(owner, repo, number, token, payload)
+                posted = True
+            result = ReviewResult(
+                pr_url=pr_url,
+                owner=owner,
+                repo=repo,
+                number=number,
                 head_sha=head_sha,
-                payload=_payload(head_sha, TOO_LARGE, []),
+                dry_run=dry_run,
+                posted=posted,
+                payload=payload,
                 grounding={"grounded": 0, "near": 0, "ungrounded": 0},
-                anchoring={"inline": 0, "summary": 0},
+                anchoring={"inline": 0, "summary": 0, "dropped": 0},
                 findings=[],
+                prompt_sha=hashlib.sha256(system_prompt().encode()).hexdigest(),
+                model=settings.model,
                 tokens_in=0,
                 tokens_out=0,
+                wall_clock_s=round(time.monotonic() - t0, 3),
+                temp_dir_removed=True,
+                status="published",
+                corpus=[{"source": "diff", "text": diff}],
                 trace=[],
             )
-        else:
-            tmp = tempfile.mkdtemp(prefix="auto-pr-")
-            _clone_head(tmp, owner, repo, number, token, head_sha)
-            trace: list = []
-            review = run(diff=diff, repo_root=tmp, trace=trace)
-            rows = ground(review.findings, diff, _tool_results(trace))
-            published, payload = _build_payload(review, rows, diff, head_sha)
-            done = dict(
-                head_sha=head_sha,
-                payload=payload,
-                grounding=grounding_counts(rows),
-                anchoring=_anchor_counts(published),
-                findings=published,
-                tokens_in=sum(s.get("api_in") or 0 for s in trace),
-                tokens_out=sum(s.get("api_out") or 0 for s in trace),
-                trace=trace,
-            )
-    finally:
-        removed = True
-        if tmp is not None:
-            _rmtree(tmp)
-            removed = not os.path.exists(tmp)
+            _write_trace(result, [])
+            return result
 
-    assert done is not None
-    return _finish(
-        pr_url,
-        owner,
-        repo,
-        number,
-        done["head_sha"],
-        dry_run,
-        done["payload"],
-        done["grounding"],
-        done["anchoring"],
-        done["findings"],
-        prompt_sha,
-        model,
-        done["tokens_in"],
-        done["tokens_out"],
-        t0,
-        removed,
-        token,
-        None,
-        done["trace"],
-    )
-
-
-def _clone_head(
-    dest: str, owner: str, repo: str, number: int, token: str, head_sha: str
-) -> None:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-    origin = f"https://github.com/{owner}/{repo}.git"
-    auth = ["-c", f"http.extraHeader=Authorization: Bearer {token}"]
-
-    def git(args: list[str], extra: list[str] | None = None) -> str:
-        cmd = ["git", "-C", dest, *(extra or []), *args]
-        try:
-            proc = subprocess.run(
-                cmd, check=True, capture_output=True, text=True, env=env
-            )
-            return proc.stdout
-        except subprocess.CalledProcessError as e:
-            msg = (e.stderr or e.stdout or "").strip()
-            raise RuntimeError(
-                f"git {args[0]} failed: {_redact(msg, token)}"
-            ) from None
-
-    git(["init"])
-    git(["remote", "add", "origin", origin])
-    git(["fetch", "--depth=1", "origin", f"pull/{number}/head"], extra=auth)
-    git(["checkout", "FETCH_HEAD"])
-    got = git(["rev-parse", "HEAD"]).strip()
-    if got != head_sha:
-        raise RuntimeError(
-            f"HEAD {got} != head.sha {head_sha}; PR moved mid-run"
-        )
-
-
-def _tool_results(trace: list) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for step in trace:
-        for call in step.get("tools") or []:
-            path = (call.get("input") or {}).get("path", "")
-            name = call.get("name") or "tool"
-            label = f"{name}:{path}" if path else name
-            out.append((label, call.get("result") or ""))
-    return out
-
-
-def _finding_body(finding: Finding) -> str:
-    parts = [finding.title, "", finding.description]
-    if finding.recommendation:
-        parts.extend(["", f"Recommendation: {finding.recommendation}"])
-    return "\n".join(parts).strip()
-
-
-def _build_payload(
-    review: ReviewFindings,
-    rows: list,
-    diff: str,
-    head_sha: str,
-) -> tuple[list[PublishedFinding], dict]:
-    anchorable = parse_anchorable(diff)
-    published: list[PublishedFinding] = []
-    comments: list[dict] = []
-    summary_items: list[str] = []
-    for finding, verdict, _source in rows:
-        body = _finding_body(finding)
-        if verdict != "grounded":
-            published.append(
-                PublishedFinding(
-                    severity=finding.severity,
-                    category=finding.category,
-                    path=finding.file,
-                    line=None,
-                    title=finding.title,
-                    body=body,
-                    evidence=finding.evidence,
-                    verdict=verdict,
-                    anchored="dropped",
-                )
-            )
-            continue
-        loc = locate_in_diff(diff, finding.evidence)
-        if loc is not None and loc[1] in anchorable.get(loc[0], set()):
-            path, line = loc
-            comments.append(
+        tmp = tempfile.mkdtemp(prefix="auto-pr-")
+        clone_head(tmp, owner, repo, number, token, head_sha)
+        db = PROJECT_ROOT / "runs" / "checkpoints.db"
+        db.parent.mkdir(exist_ok=True)
+        with SqliteSaver.from_conn_string(str(db)) as saver:
+            saver.setup()
+            app = build_graph().compile(checkpointer=saver)
+            final: ReviewState = app.invoke(
                 {
-                    "path": path,
-                    "line": line,
-                    "side": "RIGHT",
-                    "body": body,
-                }
+                    "run_id": run_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "number": number,
+                    "dry_run": dry_run,
+                    "head_sha": head_sha,
+                    "diff": diff,
+                    "workspace": tmp,
+                    "corpus": [{"source": "diff", "text": diff}],
+                    "status": "running",
+                    "started_at": t0,
+                    "iterations": 0,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "messages": [],
+                    "findings": [],
+                    "budget_breach": None,
+                    "error": None,
+                    "posted": False,
+                },
+                config={
+                    "configurable": {"thread_id": run_id},
+                    "recursion_limit": RECURSION_LIMIT,
+                },
             )
-            published.append(
-                PublishedFinding(
-                    severity=finding.severity,
-                    category=finding.category,
-                    path=path,
-                    line=line,
-                    title=finding.title,
-                    body=body,
-                    evidence=finding.evidence,
-                    verdict=verdict,
-                    anchored="inline",
-                )
-            )
-        else:
-            path = loc[0] if loc is not None else finding.file
-            line = loc[1] if loc is not None else None
-            loc_label = f"{path}:{line}" if line is not None else path
-            summary_items.append(f"**{loc_label}** — {body}")
-            published.append(
-                PublishedFinding(
-                    severity=finding.severity,
-                    category=finding.category,
-                    path=path,
-                    line=line,
-                    title=finding.title,
-                    body=body,
-                    evidence=finding.evidence,
-                    verdict=verdict,
-                    anchored="summary",
-                )
-            )
-    body_parts = [review.summary.strip()] if review.summary.strip() else []
-    body_parts.extend(summary_items)
-    if not comments and not summary_items:
-        if not body_parts:
-            body_parts.append("Reviewed, nothing found.")
-    payload = _payload(head_sha, "\n\n".join(body_parts).strip(), comments)
-    return published, payload
-
-
-def _payload(commit_id: str, body: str, comments: list[dict]) -> dict:
-    return {
-        "commit_id": commit_id,
-        "event": "COMMENT",
-        "body": body,
-        "comments": comments,
-    }
-
-
-def _anchor_counts(findings: list[PublishedFinding]) -> dict[str, int]:
-    tally = {"inline": 0, "summary": 0}
-    for f in findings:
-        if f.anchored in tally:
-            tally[f.anchored] += 1
-    return tally
+        result = _finish(
+            final, pr_url, owner, repo, number, token, dry_run, t0, True, trace
+        )
+        return result
+    finally:
+        trace_holder.reset(trace_tok)
+        if tmp is not None:
+            rmtree(tmp)
+            gone = not os.path.exists(tmp)
+            if result is not None:
+                result.temp_dir_removed = gone
 
 
 def _finish(
+    state: ReviewState,
     pr_url: str,
     owner: str,
     repo: str,
     number: int,
-    head_sha: str,
+    token: str,
     dry_run: bool,
-    payload: dict,
-    grounding: dict[str, int],
-    anchoring: dict[str, int],
-    findings: list[PublishedFinding],
-    prompt_sha: str,
-    model: str,
-    tokens_in: int,
-    tokens_out: int,
     t0: float,
     temp_dir_removed: bool,
-    token: str,
-    error: str | None,
     trace: list,
 ) -> ReviewResult:
+    settings = get_settings()
+    status = state.get("status") or "running"
+    summary = state.get("summary") or ""
+    items = list(state.get("findings") or [])
+    payload: dict
+    published: list[dict]
+    tally: dict
     posted = False
-    if not dry_run:
-        github.post_review(owner, repo, number, token, payload)
-        posted = True
-        for f in findings:
-            if f.anchored != "dropped":
-                f.posted = True
+    if status == "failed":
+        published = items
+        tally = {"inline": 0, "summary": 0, "dropped": 0}
+        payload = {
+            "commit_id": state.get("head_sha") or "",
+            "event": "COMMENT",
+            "body": state.get("error") or "failed",
+            "comments": [],
+        }
+    else:
+        published, payload, tally = build_review(
+            items, state.get("diff") or "", state["head_sha"], summary
+        )
+        if not dry_run:
+            post_review(owner, repo, number, token, payload)
+            posted = True
+            for f in published:
+                if f.get("anchored") != "dropped":
+                    f["posted"] = True
+        if status == "running":
+            status = "published"
+
+    findings: list[PublishedFinding] = []
+    for item in published:
+        try:
+            findings.append(
+                PublishedFinding(
+                    severity=item.get("severity") or "nit",
+                    category=item.get("category") or "maintainability",
+                    path=item.get("path") or item.get("file") or "",
+                    line=item.get("line"),
+                    title=item.get("title") or "",
+                    body=item.get("body") or "",
+                    evidence=item.get("evidence") or "",
+                    verdict=item.get("verdict") or "ungrounded",
+                    anchored=item.get("anchored") or "dropped",
+                    posted=bool(item.get("posted")),
+                )
+            )
+        except ValidationError:
+            continue
+
     result = ReviewResult(
         pr_url=pr_url,
         owner=owner,
         repo=repo,
         number=number,
-        head_sha=head_sha,
+        head_sha=state.get("head_sha") or "",
         dry_run=dry_run,
         posted=posted,
         payload=payload,
-        grounding=grounding,
-        anchoring=anchoring,
+        grounding=state.get("grounding")
+        or {"grounded": 0, "near": 0, "ungrounded": 0},
+        anchoring=tally,
         findings=findings,
-        prompt_sha=prompt_sha,
-        model=model,
-        tokens_in=tokens_in,
-        tokens_out=tokens_out,
+        prompt_sha=state.get("prompt_sha")
+        or hashlib.sha256(system_prompt().encode()).hexdigest(),
+        model=settings.model,
+        tokens_in=int(state.get("tokens_in") or 0),
+        tokens_out=int(state.get("tokens_out") or 0),
         wall_clock_s=round(time.monotonic() - t0, 3),
         temp_dir_removed=temp_dir_removed,
-        error=error,
+        error=state.get("error"),
+        status=status if status != "too_large" else "published",
+        corpus=list(state.get("corpus") or []),
+        trace=trace,
     )
     _write_trace(result, trace)
     return result
@@ -315,25 +243,7 @@ def _write_trace(result: ReviewResult, trace: list) -> None:
         "findings": [f.model_dump() for f in result.findings],
         "payload": result.payload,
         "error": result.error,
+        "status": result.status,
     }
     out.write_text(json.dumps(payload, indent=2))
     print(f"wrote {out}")
-
-
-def _redact(text: str, token: str) -> str:
-    if not token:
-        return text
-    return text.replace(token, "***")
-
-
-def _rmtree(path: str) -> None:
-    def onerror(func, p, _exc_info):
-        try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
-        except Exception:
-            pass
-
-    shutil.rmtree(path, onerror=onerror)
-    if os.path.exists(path):
-        raise RuntimeError(f"temp dir still present: {path}")

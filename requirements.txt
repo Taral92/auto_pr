@@ -1,3 +1,9 @@
 anthropic
 pydantic
+pydantic-settings
 python-dotenv
+langgraph
+langgraph-checkpoint-sqlite
+fastapi
+uvicorn
+certifi

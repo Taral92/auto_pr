@@ -1,10 +1,17 @@
 import json
+import ssl
 import urllib.error
 import urllib.request
 from typing import Any
 
+import certifi
+
+from core.errors import PermanentError, TransientError
+
 API = "https://api.github.com"
 USER_AGENT = "auto-pr"
+
+_TRANSIENT_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
 
 def get_pr(owner: str, repo: str, number: int, token: str) -> dict[str, Any]:
@@ -40,8 +47,8 @@ def post_review(
             data=payload,
         )
         return json.loads(body)
-    except RuntimeError as e:
-        if " 422 " not in str(e):
+    except PermanentError as e:
+        if e.code != 422:
             raise
         comments = list(payload.get("comments") or [])
         if not comments:
@@ -87,10 +94,14 @@ def _request(
     if raw is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
             return resp.read().decode("utf-8"), resp.status
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GitHub {e.code} {method} {url}: {err_body[:800]}") from None
+        msg = f"GitHub {e.code} {method} {url}: {err_body[:800]}"
+        if e.code in _TRANSIENT_CODES:
+            raise TransientError(msg, code=e.code) from None
+        raise PermanentError(msg, code=e.code) from None
     except urllib.error.URLError as e:
-        raise RuntimeError(f"GitHub {method} {url} failed: {e.reason}") from None
+        raise TransientError(f"GitHub {method} {url} failed: {e.reason}") from None

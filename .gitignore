@@ -7,4 +7,8 @@ docs/
 fixtures/
 agent/claude.md
 .gitignore
+auto_pr.db
+auto_pr.db-wal
+auto_pr.db-shm
 
+.fuse_hidden*
