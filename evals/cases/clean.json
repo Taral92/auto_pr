@@ -1,0 +1,7 @@
+{
+  "id": "clean",
+  "description": "Negative control: a diff with no defect. Any published finding is a false positive. Without this you cannot tell a careful reviewer from a noisy one.",
+  "pr_url": "https://github.com/Taral92/auto_pr/pull/3",
+  "cassette": "clean",
+  "expected": []
+}

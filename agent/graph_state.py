@@ -39,6 +39,7 @@ class ReviewState(TypedDict, total=False):
     tokens_in: int
     tokens_out: int
     started_at: float
+    tool_bytes: int
     budget_breach: str | None
 
     # outcome

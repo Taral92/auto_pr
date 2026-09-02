@@ -53,3 +53,9 @@ def counts(rows: list[tuple[Finding, Verdict, str | None]]) -> dict[str, int]:
     for _, verdict, _ in rows:
         tally[verdict] += 1
     return tally
+
+
+
+
+
+

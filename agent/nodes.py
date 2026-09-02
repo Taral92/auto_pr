@@ -11,7 +11,8 @@ from core.models import Finding, ReviewFindings
 from .graph_state import ReviewState
 from .grounding import counts as grounding_counts
 from .grounding import ground as ground_findings
-from .runtime import check_cancel, trace_holder
+from .model_client import ModelClient
+from .runtime import check_cancel, model_client_var, trace_holder
 from .tools import DISPATCH, TOOL_SCHEMAS
 
 SYSTEM = """You are a code reviewer. You are reviewing ONE pull request diff.
@@ -103,13 +104,24 @@ def _trace(step: dict) -> None:
         pass
 
 
+def _model() -> ModelClient:
+    try:
+        return model_client_var.get()
+    except LookupError:
+        client = ModelClient()
+        model_client_var.set(client)
+        return client
+
+
 def _call_model(*, system: str, messages: list, tools: list | None = None):
-    settings = get_settings()
-    # Cache the system block: it is identical on every iteration, and without
-    # this a 7-iteration run re-bills the full prefix 7 times.
-    kwargs = dict(
-        model=settings.model,
-        max_tokens=settings.max_tokens,
+    """Cache breakpoints: the system block and the first user message.
+
+    Both are byte-identical on every iteration of a run, and the diff in that
+    first message is the single biggest thing we would otherwise re-send. Two
+    breakpoints is the whole budget worth spending - the tail of `messages`
+    grows every turn, so a breakpoint there would miss on every call.
+    """
+    return _model().call(
         system=[
             {
                 "type": "text",
@@ -118,18 +130,8 @@ def _call_model(*, system: str, messages: list, tools: list | None = None):
             }
         ],
         messages=messages,
+        tools=tools,
     )
-    if tools is not None:
-        kwargs["tools"] = tools
-    try:
-        return _client().messages.create(**kwargs)
-    except APIConnectionError as e:
-        raise TransientError(str(e)) from e
-    except APIStatusError as e:
-        msg = str(e)
-        if e.status_code in _TRANSIENT_HTTP:
-            raise TransientError(msg, code=e.status_code) from e
-        raise PermanentError(msg, code=e.status_code) from e
 
 
 def changed_files(diff: str) -> list[str]:
@@ -146,9 +148,10 @@ def changed_files(diff: str) -> list[str]:
         new = line[4:].strip()
         old = lines[i - 1][4:].strip() if i and lines[i - 1].startswith("--- ") else ""
         if new == "/dev/null":
-            path, status = old[2:] if old.startswith("b/") or old.startswith("a/") else old, "deleted"
+            path = old[2:] if old.startswith(("a/", "b/")) else old
+            status = "deleted"
         else:
-            path = new[2:] if new.startswith("b/") or new.startswith("a/") else new
+            path = new[2:] if new.startswith(("a/", "b/")) else new
             status = "added" if old == "/dev/null" else "modified"
         out.append(f"  {path} ({status})")
     return out
@@ -164,11 +167,17 @@ def assemble_context(state: ReviewState) -> dict:
         "messages": [
             {
                 "role": "user",
-                "content": (
-                    f"CHANGED FILES ({len(manifest)}):\n"
-                    + "\n".join(manifest)
-                    + f"\n\nDIFF:\n\n{state['diff']}"
-                ),
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"CHANGED FILES ({len(manifest)}):\n"
+                            + "\n".join(manifest)
+                            + f"\n\nDIFF:\n\n{state['diff']}"
+                        ),
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
             }
         ],
         "iterations": 0,
@@ -273,8 +282,12 @@ def execute_tools(state: ReviewState) -> dict:
     out: dict = {"messages": messages, "corpus": corpus}
     tokens = int(state.get("tokens_in") or 0) + int(state.get("tokens_out") or 0)
     started = float(state.get("started_at") or time.monotonic())
+    tool_bytes = sum(len(c.get("text") or "") for c in corpus if c.get("source") != "diff")
+    out["tool_bytes"] = tool_bytes
     if int(state.get("iterations") or 0) >= settings.max_iterations:
         out["budget_breach"] = "iterations"
+    elif tool_bytes >= settings.max_tool_bytes_total:
+        out["budget_breach"] = "tool_bytes"
     elif tokens >= settings.max_tokens_total:
         out["budget_breach"] = "tokens"
     elif time.monotonic() - started >= settings.max_wall_clock_s:

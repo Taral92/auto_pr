@@ -1,0 +1,22 @@
+{
+  "id": "pr-001",
+  "description": "Two injected defects in agent/tools.py: the path jail is removed from read_file, and search_code gains a shell backdoor.",
+  "pr_url": "https://github.com/Taral92/auto_pr/pull/2",
+  "cassette": "pr-001",
+  "expected": [
+    {
+      "id": "jail-removed",
+      "path": "agent/tools.py",
+      "category": "security",
+      "severity": "blocker",
+      "must_contain": ["read_bytes()"]
+    },
+    {
+      "id": "os-system-backdoor",
+      "path": "agent/tools.py",
+      "category": "security",
+      "severity": "blocker",
+      "must_contain": ["os.system"]
+    }
+  ]
+}

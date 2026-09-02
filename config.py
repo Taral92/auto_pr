@@ -18,6 +18,15 @@ class Settings(BaseSettings):
     max_diff_bytes: int = 400_000
     db_path: str = "auto_pr.db"
 
+    # Record/replay. live = call the API. record = call it and save the
+    # responses. replay = read them off disk and never touch the network.
+    model_mode: str = "live"          # live | record | replay
+    cassette: str = ""                # cassette name under evals/cassettes/
+
+    # Context budget. Caps cumulative tool output fed back into the loop,
+    # independent of any single tool's own truncation.
+    max_tool_bytes_total: int = 120_000
+
     model_config = SettingsConfigDict(
         env_file=str(ROOT / ".env"),
         extra="ignore",
