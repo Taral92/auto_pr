@@ -1,12 +1,10 @@
 .env
-runs/
+.venv/
 __pycache__/
 *.pyc
-.venv/
-docs/
-fixtures/
-agent/claude.md
-.gitignore
+
+# local run artifacts
+runs/
 auto_pr.db
 auto_pr.db-wal
 auto_pr.db-shm
