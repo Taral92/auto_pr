@@ -5,4 +5,4 @@ __pycache__/
 .venv/
 docs/
 fixtures/
-clude.md
+agent/claude.md
