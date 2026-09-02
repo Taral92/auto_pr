@@ -1,0 +1,8 @@
+.env
+runs/
+__pycache__/
+*.pyc
+.venv/
+docs/
+fixtures/
+agent/claude.md
