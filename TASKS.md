@@ -1,63 +1,58 @@
 # Open work
 
-Ordered. Do not skip ahead — each step's failure mode is cheaper to find than
-the next one's.
+## Done
 
-## 1. Smoke the Postgres path  ← START HERE
+1. Postgres verified against a real database — two workers, no double-claim,
+   lease recovery on `kill -9`.
+2. Hermetic evals. The runner loads `evals/fixtures/*/` and calls
+   `review_local()` — no GitHub, no token, no network. A previous live-PR eval
+   read its own answer key out of `evals/cases/`; that can no longer happen,
+   and a contamination guard test stops it regressing.
+3. First honest result, and the two bugs it surfaced:
+   - grounding could not match multi-line evidence (diff prefixes)
+   - anchoring had the same bug one layer down, so grounded findings were
+     demoted to summary
+   Both fixed by sharing one post-image parser.
 
-None of the new SQL has run against a real Postgres. Expect typos.
-
-```bash
-docker compose up -d db
-pip install -r requirements.txt
-uvicorn api.main:app --port 8000     # applies schema on startup
-python -m worker.main                # separate shell
+```
+sandbox-escape  tp 2  fp 0  fn 0  precision 1.0  recall 1.0
+                groundedness 1.0  inline_rate 1.0  net +24 min/PR
 ```
 
-Verify:
-- [ ] `GET /healthz` returns server_version and state counts
-- [ ] `POST /api/review {"pr_url": ..., "dry_run": true}` → 202 with run_id
-- [ ] the row reaches `published` or `degraded`, never sticks in `running`
-- [ ] `GET /api/runs/{id}` returns findings; `/trace` returns corpus
-- [ ] two workers running: no row is ever claimed twice
-- [ ] `kill -9` a worker mid-run → the lease expires → the other reclaims it
+50 tests pass.
 
-## 2. Wire the hermetic evals
+## 4. Ship it  ← NEXT
 
-`evals/fixtures/sandbox-escape/` and `agent/local.py` exist but the runner
-still reviews live PRs — and the last live run read
-`evals/cases/pr-001.json`, its own answer key. Every number from it is void.
+Nothing has ever reached GitHub. Every run so far was `--dry-run` or local.
 
-- [ ] runner loads `evals/fixtures/*/{repo,head.diff,expected.json}`
-- [ ] calls `review_local(repo_dir, diff)` instead of `review_pr`
-- [ ] no token, no network, works on replay
-- [ ] delete `evals/cases/*.json` once ported
+- [ ] Create the App: Contents **Read**, Pull requests **Read & write**,
+      event **Pull request**
+- [ ] `npx smee-client --url https://smee.io/<channel> --target http://localhost:8000/webhook`
+- [ ] Webhook URL → the smee channel; set a secret → `GITHUB_WEBHOOK_SECRET`
+- [ ] `base64 -i key.pem | tr -d '\n'` → `GITHUB_APP_PRIVATE_KEY`
+- [ ] Install on `auto_pr`, open a PR
 
-## 3. First recorded eval
+Verify, in this order — each catches a different failure:
 
-```bash
-python -m evals.runner --record
-python -m evals.runner --live --reps 5
-```
-
-`--reps 5` in replay mode is a no-op: replay is deterministic, so repetitions
-only measure variance with `--live`.
-
-Ground truth is 2 blockers in `app/files.py`. Watch for:
-- `grounded > 0` — has never happened in a live run
-- `inline > 0` — anchoring produces a postable comment
-- `fp` on a two-hunk diff — it is inventing findings
-
-## 4. Wire the App
-
-Create the App (Contents: Read, Pull requests: Read & write, event: Pull
-request), point the webhook at smee, install on one repo, open a PR.
-
-- [ ] webhook 202s in under a second
-- [ ] a real inline comment appears
-- [ ] push again → old run superseded, exactly one review
+- [ ] webhook returns 202 in under a second (it must not call the model)
+- [ ] a real **inline** comment appears on the changed line
+- [ ] push again → the older run is superseded, exactly one review exists
 - [ ] redeliver the webhook from GitHub's UI → no duplicate comment
+      (exercises `delivery_id UNIQUE` and the review-body marker)
+- [ ] `kill -9` the worker mid-review → another worker reclaims after the lease
 
-## 5. Deploy
+## 5. Second fixture
 
-Two processes, one Postgres. Fly.io or a VM. `/healthz` as the check.
+One fixture and two defects is not a benchmark.
+
+- [ ] a **negative control**: a diff with no defect. Any published finding is
+      a false positive. Without this you cannot tell a careful reviewer from a
+      quiet one.
+- [ ] a non-security fixture — every case so far is a security bug, where the
+      model's priors are strongest.
+
+## 6. Deploy
+
+Two processes, one Postgres, `/healthz` as the check. Fly.io or a VM.
+Decide whether production uses Supabase or its own Postgres; the compose `db`
+service is dev-only either way.
