@@ -16,7 +16,20 @@ class Settings(BaseSettings):
     max_wall_clock_s: int = 300
     max_tokens_total: int = 200_000
     max_diff_bytes: int = 400_000
-    db_path: str = "auto_pr.db"
+    # Postgres
+    database_url: str = "postgresql://autopr:autopr@localhost:5432/autopr"
+    db_pool_size: int = 10
+
+    # GitHub App
+    github_app_id: str = ""
+    github_app_private_key: SecretStr = SecretStr("")   # PEM or base64 PEM
+    github_webhook_secret: SecretStr = SecretStr("")
+
+    # Worker
+    lease_s: int = 900                # MUST exceed max_wall_clock_s, or a slow
+                                      # run gets reclaimed and reviewed twice
+    max_attempts: int = 3
+    poll_interval_s: float = 2.0
 
     # Record/replay. live = call the API. record = call it and save the
     # responses. replay = read them off disk and never touch the network.

@@ -34,6 +34,29 @@ def get_diff(owner: str, repo: str, number: int, token: str) -> str:
     return body
 
 
+MARKER = "<!-- auto-pr:{key} -->"
+
+
+def already_reviewed(owner: str, repo: str, number: int, token: str, key: str) -> bool:
+    """Has this exact (pr, head_sha, prompt) already been reviewed?
+
+    GitHub redelivers webhooks and Actions re-run, so without this a single PR
+    collects the same comments several times. The marker is an HTML comment in
+    the review body - invisible to readers, and it survives edits to the rest.
+    """
+    marker = MARKER.format(key=key)
+    try:
+        body, _ = _request(
+            "GET",
+            f"{API}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100",
+            token,
+            accept="application/vnd.github+json",
+        )
+    except PermanentError:
+        return False          # can't check -> post. A duplicate beats silence.
+    return any(marker in (r.get("body") or "") for r in json.loads(body))
+
+
 def post_review(
     owner: str, repo: str, number: int, token: str, payload: dict[str, Any]
 ) -> dict[str, Any]:

@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -7,7 +9,7 @@ class ReviewRequest(BaseModel):
 
 
 class ReviewAccepted(BaseModel):
-    run_id: str
+    run_id: str | None
 
 
 class RunSummary(BaseModel):
@@ -16,24 +18,26 @@ class RunSummary(BaseModel):
     owner: str
     repo: str
     pr_number: int
-    head_sha: str | None
-    dry_run: bool
+    head_sha: str | None = None
+    dry_run: bool = False
     state: str
-    attempts: int
-    error: str | None
-    prompt_sha: str | None
-    model: str | None
-    tokens_in: int | None
-    tokens_out: int | None
-    wall_clock_s: float | None
-    grounded: int | None
-    near: int | None
-    ungrounded: int | None
-    inline: int | None
-    summary: int | None
-    dropped: int | None
-    created_at: float
-    finished_at: float | None
+    attempts: int = 0
+    error: str | None = None
+    installation_id: int | None = None
+    prompt_sha: str | None = None
+    model: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    wall_clock_s: float | None = None
+    grounded: int | None = None
+    near: int | None = None
+    ungrounded: int | None = None
+    inline: int | None = None
+    summary: int | None = None
+    dropped: int | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class FindingOut(BaseModel):
@@ -41,13 +45,13 @@ class FindingOut(BaseModel):
     severity: str
     category: str
     path: str
-    line: int | None
+    line: int | None = None
     title: str
     body: str
     evidence: str
     verdict: str
     anchored: str
-    posted: bool
+    posted: bool = False
 
 
 class RunDetail(RunSummary):
@@ -56,17 +60,10 @@ class RunDetail(RunSummary):
 
 class TraceOut(BaseModel):
     run_id: str
-    corpus: list | None
-    trace: list | None
+    corpus: list | None = None
+    trace: list | None = None
 
 
 class CancelOut(BaseModel):
     id: str
     cancel: bool
-
-
-class Healthz(BaseModel):
-    db: str
-    sqlite_version: str
-    queued: int
-    running: int

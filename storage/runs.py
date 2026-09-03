@@ -1,218 +1,240 @@
+"""Run queue and history.
+
+The claim query is the whole concurrency story:
+
+    SELECT ... FOR UPDATE SKIP LOCKED
+
+`SKIP LOCKED` is why this scales past one worker. Without it, N workers all
+block on the same oldest row and you have a serial queue wearing a pool's
+clothes. With it, each worker takes the oldest row nobody else holds.
+"""
+
+from __future__ import annotations
+
 import json
-import sqlite3
-import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from core.models import ReviewResult
+from .db import pool
 
 CLAIM_SQL = """
-UPDATE runs
-   SET state='running', leased_until=:leased_until, worker_id=:wid,
-       attempts=attempts+1, started_at=:now
- WHERE id = (
-       SELECT id FROM runs
-        WHERE state='queued'
-           OR (state='running' AND leased_until < :now)
-        ORDER BY created_at
-        LIMIT 1)
-RETURNING id
+WITH picked AS (
+    SELECT id
+      FROM runs
+     WHERE state = 'queued'
+        OR (state = 'running' AND leased_until < now())   -- reclaim a dead lease
+     ORDER BY created_at
+     FOR UPDATE SKIP LOCKED
+     LIMIT 1
+)
+UPDATE runs r
+   SET state        = 'running',
+       leased_until = now() + %(lease)s::interval,
+       worker_id    = %(worker_id)s,
+       attempts     = r.attempts + 1,
+       started_at   = COALESCE(r.started_at, now())
+  FROM picked
+ WHERE r.id = picked.id
+RETURNING r.*
 """
 
 
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def insert_queued(
-    conn: sqlite3.Connection,
     *,
-    run_id: str,
     pr_url: str,
     owner: str,
     repo: str,
     pr_number: int,
-    dry_run: bool,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO runs (
-            id, pr_url, owner, repo, pr_number, dry_run, state, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
-        """,
-        (run_id, pr_url, owner, repo, pr_number, int(dry_run), time.time()),
-    )
-    conn.commit()
+    dry_run: bool = False,
+    installation_id: int | None = None,
+    delivery_id: str | None = None,
+) -> str | None:
+    """Returns the run id, or None if this delivery was already accepted.
 
-
-def claim(
-    conn: sqlite3.Connection, *, now: float, lease_s: float, worker_id: str
-) -> sqlite3.Row | None:
-    cur = conn.execute(
-        CLAIM_SQL,
-        {"leased_until": now + lease_s, "wid": worker_id, "now": now},
-    )
-    row = cur.fetchone()
-    if row is None:
-        conn.commit()
-        return None
-    full = conn.execute("SELECT * FROM runs WHERE id = ?", (row["id"],)).fetchone()
-    conn.commit()
-    return full
-
-
-def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-
-
-def list_runs(
-    conn: sqlite3.Connection, *, limit: int, cursor: float | None
-) -> list[sqlite3.Row]:
-    if cursor is None:
-        return list(
-            conn.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            )
-        )
-    return list(
-        conn.execute(
+    ON CONFLICT on delivery_id is the first line of defence against GitHub
+    redelivery - it rejects the duplicate before any work is scheduled.
+    """
+    run_id = str(uuid.uuid4())
+    with pool().connection() as conn:
+        row = conn.execute(
             """
-            SELECT * FROM runs
-             WHERE created_at < ?
-             ORDER BY created_at DESC
-             LIMIT ?
+            INSERT INTO runs (id, pr_url, owner, repo, pr_number, dry_run,
+                              installation_id, delivery_id, state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued')
+            ON CONFLICT (delivery_id) DO NOTHING
+            RETURNING id
             """,
-            (cursor, limit),
-        )
-    )
+            (run_id, pr_url, owner, repo, pr_number, dry_run,
+             installation_id, delivery_id),
+        ).fetchone()
+    return row["id"] if row else None
 
 
-def findings_for(conn: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
-    return list(
+def coalesce_pr(owner: str, repo: str, pr_number: int, head_sha: str | None) -> dict:
+    """Supersede queued work and cancel running work for an older head_sha.
+
+    A branch pushed five times in two minutes must produce one review. Without
+    this, cost scales with pushes rather than with pull requests, and the
+    author gets five stale comment threads.
+    """
+    with pool().connection() as conn:
+        superseded = conn.execute(
+            """
+            UPDATE runs SET state='superseded', finished_at=now()
+             WHERE owner=%s AND repo=%s AND pr_number=%s
+               AND state='queued'
+               AND (head_sha IS DISTINCT FROM %s)
+            RETURNING id
+            """,
+            (owner, repo, pr_number, head_sha),
+        ).fetchall()
+        cancelled = conn.execute(
+            """
+            UPDATE runs SET cancel=TRUE
+             WHERE owner=%s AND repo=%s AND pr_number=%s
+               AND state='running'
+               AND (head_sha IS DISTINCT FROM %s)
+            RETURNING id
+            """,
+            (owner, repo, pr_number, head_sha),
+        ).fetchall()
+    return {"superseded": len(superseded), "cancelled": len(cancelled)}
+
+
+def claim(*, lease_s: int, worker_id: str) -> dict | None:
+    with pool().connection() as conn:
+        return conn.execute(
+            CLAIM_SQL,
+            {"lease": timedelta(seconds=lease_s), "worker_id": worker_id},
+        ).fetchone()
+
+
+def heartbeat(run_id: str, *, lease_s: int) -> None:
+    """Extend the lease of a run still doing work.
+
+    Without this, any review slower than the lease gets reclaimed and reviewed
+    twice. The alternative - a lease long enough for the worst case - means a
+    crashed worker's job sits stuck for that same worst case.
+    """
+    with pool().connection() as conn:
         conn.execute(
-            "SELECT * FROM findings WHERE run_id = ? ORDER BY rowid",
-            (run_id,),
+            "UPDATE runs SET leased_until = now() + %s::interval WHERE id = %s",
+            (timedelta(seconds=lease_s), run_id),
         )
-    )
 
 
-def set_cancel(conn: sqlite3.Connection, run_id: str) -> bool:
-    cur = conn.execute("UPDATE runs SET cancel = 1 WHERE id = ?", (run_id,))
-    conn.commit()
-    return cur.rowcount > 0
-
-
-def is_cancelled(conn: sqlite3.Connection, run_id: str) -> bool:
-    row = conn.execute("SELECT cancel FROM runs WHERE id = ?", (run_id,)).fetchone()
+def is_cancelled(run_id: str) -> bool:
+    with pool().connection() as conn:
+        row = conn.execute("SELECT cancel FROM runs WHERE id=%s", (run_id,)).fetchone()
     return bool(row and row["cancel"])
 
 
-def requeue(conn: sqlite3.Connection, run_id: str, error: str) -> None:
-    conn.execute(
-        """
-        UPDATE runs
-           SET state='queued', leased_until=NULL, worker_id=NULL, error=?
-         WHERE id=?
-        """,
-        (error, run_id),
-    )
-    conn.commit()
+def set_cancel(run_id: str) -> bool:
+    with pool().connection() as conn:
+        row = conn.execute(
+            "UPDATE runs SET cancel=TRUE WHERE id=%s RETURNING id", (run_id,)
+        ).fetchone()
+    return row is not None
 
 
-def mark_state(
-    conn: sqlite3.Connection,
-    run_id: str,
-    state: str,
-    *,
-    error: str | None = None,
-) -> None:
-    conn.execute(
-        """
-        UPDATE runs
-           SET state=?, error=?, finished_at=?
-         WHERE id=?
-        """,
-        (state, error, time.time(), run_id),
-    )
-    conn.commit()
+def mark(run_id: str, state: str, *, error: str | None = None) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            "UPDATE runs SET state=%s, error=%s, finished_at=now() WHERE id=%s",
+            (state, error, run_id),
+        )
 
 
-def record_result(
-    conn: sqlite3.Connection, run_id: str, result: ReviewResult, state: str
-) -> None:
-    g = result.grounding
-    a = result.anchoring
-    conn.execute(
-        """
-        UPDATE runs SET
-            head_sha=?,
-            state=?,
-            error=?,
-            prompt_sha=?,
-            model=?,
-            tokens_in=?,
-            tokens_out=?,
-            wall_clock_s=?,
-            grounded=?, near=?, ungrounded=?,
-            inline=?, summary=?, dropped=?,
-            corpus_json=?,
-            trace_json=?,
-            payload_json=?,
-            finished_at=?
-         WHERE id=?
-        """,
-        (
-            result.head_sha,
-            state,
-            result.error,
-            result.prompt_sha,
-            result.model,
-            result.tokens_in,
-            result.tokens_out,
-            result.wall_clock_s,
-            g.get("grounded"),
-            g.get("near"),
-            g.get("ungrounded"),
-            a.get("inline"),
-            a.get("summary"),
-            a.get("dropped"),
-            json.dumps(result.corpus),
-            json.dumps(result.trace),
-            json.dumps(result.payload),
-            time.time(),
-            run_id,
-        ),
-    )
-    conn.execute("DELETE FROM findings WHERE run_id = ?", (run_id,))
-    for f in result.findings:
+def requeue(run_id: str, *, error: str) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            """UPDATE runs SET state='queued', leased_until=NULL,
+                               worker_id=NULL, error=%s WHERE id=%s""",
+            (error, run_id),
+        )
+
+
+def record_result(run_id: str, result: Any, *, state: str) -> None:
+    g = result.grounding or {}
+    a = result.anchoring or {}
+    with pool().connection() as conn, conn.transaction():
         conn.execute(
             """
-            INSERT INTO findings (
-                id, run_id, severity, category, path, line, title, body,
-                evidence, verdict, anchored, posted
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE runs SET state=%s, head_sha=%s, prompt_sha=%s, model=%s,
+                   tokens_in=%s, tokens_out=%s, wall_clock_s=%s,
+                   grounded=%s, near=%s, ungrounded=%s,
+                   inline=%s, summary=%s, dropped=%s,
+                   corpus=%s, trace=%s, payload=%s,
+                   error=%s, finished_at=now()
+             WHERE id=%s
             """,
-            (
-                str(uuid.uuid4()),
-                run_id,
-                f.severity,
-                f.category,
-                f.path,
-                f.line,
-                f.title,
-                f.body,
-                f.evidence,
-                f.verdict,
-                f.anchored,
-                int(f.posted),
-            ),
+            (state, result.head_sha, result.prompt_sha, result.model,
+             result.tokens_in, result.tokens_out, result.wall_clock_s,
+             g.get("grounded"), g.get("near"), g.get("ungrounded"),
+             a.get("inline"), a.get("summary"), a.get("dropped"),
+             json.dumps(result.corpus), json.dumps(result.trace),
+             json.dumps(result.payload), result.error, run_id),
         )
-    conn.commit()
+        conn.execute("DELETE FROM findings WHERE run_id=%s", (run_id,))
+        for f in result.findings:
+            conn.execute(
+                """INSERT INTO findings (id, run_id, severity, category, path,
+                       line, title, body, evidence, verdict, anchored, posted)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (str(uuid.uuid4()), run_id, f.severity, f.category, f.path,
+                 f.line, f.title, f.body, f.evidence, f.verdict, f.anchored,
+                 f.posted),
+            )
 
 
-def state_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute(
-        "SELECT state, COUNT(*) AS n FROM runs GROUP BY state"
-    ).fetchall()
-    return {r["state"]: r["n"] for r in rows}
+def get_run(run_id: str) -> dict | None:
+    with pool().connection() as conn:
+        return conn.execute("SELECT * FROM runs WHERE id=%s", (run_id,)).fetchone()
 
 
-def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
+def findings_for(run_id: str) -> list[dict]:
+    with pool().connection() as conn:
+        return conn.execute(
+            "SELECT * FROM findings WHERE run_id=%s ORDER BY severity, path, line",
+            (run_id,),
+        ).fetchall()
+
+
+def list_runs(*, limit: int = 50, cursor: str | None = None) -> list[dict]:
+    with pool().connection() as conn:
+        if cursor:
+            return conn.execute(
+                """SELECT * FROM runs WHERE created_at < %s
+                   ORDER BY created_at DESC LIMIT %s""",
+                (cursor, limit),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM runs ORDER BY created_at DESC LIMIT %s", (limit,)
+        ).fetchall()
+
+
+def upsert_installation(*, gh_installation_id: int, login: str,
+                        account_type: str | None = None) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            """INSERT INTO installations (id, gh_installation_id, account_login,
+                                          account_type)
+               VALUES (%s,%s,%s,%s)
+               ON CONFLICT (gh_installation_id)
+               DO UPDATE SET account_login=EXCLUDED.account_login,
+                             suspended=FALSE""",
+            (str(uuid.uuid4()), gh_installation_id, login, account_type),
+        )
+
+
+def suspend_installation(gh_installation_id: int) -> None:
+    with pool().connection() as conn:
+        conn.execute(
+            "UPDATE installations SET suspended=TRUE WHERE gh_installation_id=%s",
+            (gh_installation_id,),
+        )

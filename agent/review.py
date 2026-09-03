@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import hashlib
 import json
 import os
@@ -12,7 +14,9 @@ from pydantic import ValidationError
 
 from config import ROOT, get_settings
 from core.models import PublishedFinding, ReviewResult
+from gh.client import MARKER
 from gh import (
+    already_reviewed,
     build_review,
     clone_head,
     get_diff,
@@ -33,9 +37,16 @@ def review_pr(
     owner: str,
     repo: str,
     number: int,
-    token: str,
+    token: "str | Callable[[], str]",
     dry_run: bool = False,
 ) -> ReviewResult:
+    """`token` may be a string (CLI, PAT) or a zero-arg provider (App).
+
+    A GitHub App installation token lives one hour and a review can start at
+    minute 58. Holding a provider rather than a string means every call mints
+    or reuses a live token instead of dying on a stale one.
+    """
+    get_token = token if callable(token) else (lambda: token)
     settings = get_settings()
     pr_url = f"https://github.com/{owner}/{repo}/pull/{number}"
     t0 = time.monotonic()
@@ -48,14 +59,14 @@ def review_pr(
     tmp: str | None = None
     result: ReviewResult | None = None
     try:
-        meta = get_pr(owner, repo, number, token)
+        meta = get_pr(owner, repo, number, get_token())
         head_sha = meta["head"]["sha"]
-        diff = get_diff(owner, repo, number, token)
+        diff = get_diff(owner, repo, number, get_token())
         if len(diff.encode("utf-8")) > settings.max_diff_bytes:
             payload = too_large_payload(head_sha)
             posted = False
             if not dry_run:
-                post_review(owner, repo, number, token, payload)
+                post_review(owner, repo, number, get_token(), payload)
                 posted = True
             result = ReviewResult(
                 pr_url=pr_url,
@@ -83,7 +94,7 @@ def review_pr(
             return result
 
         tmp = tempfile.mkdtemp(prefix="auto-pr-")
-        clone_head(tmp, owner, repo, number, token, head_sha)
+        clone_head(tmp, owner, repo, number, get_token(), head_sha)
         db = PROJECT_ROOT / "runs" / "checkpoints.db"
         db.parent.mkdir(exist_ok=True)
         with SqliteSaver.from_conn_string(str(db)) as saver:
@@ -117,7 +128,7 @@ def review_pr(
                 },
             )
         result = _finish(
-            final, pr_url, owner, repo, number, token, dry_run, t0, True, trace
+            final, pr_url, owner, repo, number, get_token, dry_run, t0, True, trace
         )
         return result
     finally:
@@ -135,7 +146,7 @@ def _finish(
     owner: str,
     repo: str,
     number: int,
-    token: str,
+    get_token: "Callable[[], str]",
     dry_run: bool,
     t0: float,
     temp_dir_removed: bool,
@@ -162,12 +173,24 @@ def _finish(
         published, payload, tally = build_review(
             items, state.get("diff") or "", state["head_sha"], summary
         )
+        # Idempotency. GitHub redelivers webhooks and Actions re-run; without
+        # this one PR collects the same comments several times. The key covers
+        # the prompt too, so a prompt change is legitimately a new review.
+        key = hashlib.sha256(
+            f"{owner}/{repo}#{number}@{state.get('head_sha')}"
+            f"~{state.get('prompt_sha')}".encode()
+        ).hexdigest()[:16]
+        payload["body"] = f"{payload.get('body','')}\n\n{MARKER.format(key=key)}".strip()
         if not dry_run:
-            post_review(owner, repo, number, token, payload)
-            posted = True
-            for f in published:
-                if f.get("anchored") != "dropped":
-                    f["posted"] = True
+            if already_reviewed(owner, repo, number, get_token(), key):
+                print(f"already reviewed {key}; skipping post")
+                status = "published"
+            else:
+                post_review(owner, repo, number, get_token(), payload)
+                posted = True
+                for f in published:
+                    if f.get("anchored") != "dropped":
+                        f["posted"] = True
         if status == "running":
             status = "published"
 
