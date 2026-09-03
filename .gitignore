@@ -10,3 +10,7 @@ auto_pr.db-wal
 auto_pr.db-shm
 
 .fuse_hidden*
+docs/
+fixtures/
+agent/claude.md
+handoff/
