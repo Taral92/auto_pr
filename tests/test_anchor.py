@@ -45,6 +45,21 @@ def test_locate_returns_correct_new_file_line():
     assert line == 18
 
 
+def test_multiline_added_evidence_anchors_to_first_line():
+    evidence = "    return Path(path).read_text()\n    # no jail"
+
+    assert locate_in_diff(DIFF, evidence) == ("agent/tools.py", 18)
+
+
+def test_added_and_context_evidence_anchors_to_added_line():
+    evidence = (
+        "    # no jail\n\n\n"
+        'def search_code(*, repo_root: str, pattern: str, path: str = ".") -> str:'
+    )
+
+    assert locate_in_diff(DIFF, evidence) == ("agent/tools.py", 19)
+
+
 def _finding(evidence, verdict):
     return {
         "severity": "blocker",
