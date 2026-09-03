@@ -14,3 +14,9 @@ docs/
 fixtures/
 agent/claude.md
 handoff/
+
+# editor / OS / secrets
+.cursor/
+.DS_Store
+*.pem
+*.key

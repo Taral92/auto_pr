@@ -76,6 +76,7 @@ async def webhook(request: Request) -> Response:
         pr_number=number,
         installation_id=(payload.get("installation") or {}).get("id"),
         delivery_id=delivery,
+        head_sha=head_sha,
     )
     if run_id is None:
         return Response(status_code=202)   # redelivery; already accepted

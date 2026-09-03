@@ -53,24 +53,29 @@ def insert_queued(
     dry_run: bool = False,
     installation_id: int | None = None,
     delivery_id: str | None = None,
+    head_sha: str | None = None,
 ) -> str | None:
     """Returns the run id, or None if this delivery was already accepted.
 
     ON CONFLICT on delivery_id is the first line of defence against GitHub
     redelivery - it rejects the duplicate before any work is scheduled.
+
+    head_sha is written here, not later by the worker. coalesce_pr compares
+    against this column; a NULL looks distinct from every SHA, so a smee
+    replay or GitHub redelivery would cancel the in-flight run.
     """
     run_id = str(uuid.uuid4())
     with pool().connection() as conn:
         row = conn.execute(
             """
             INSERT INTO runs (id, pr_url, owner, repo, pr_number, dry_run,
-                              installation_id, delivery_id, state)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued')
+                              installation_id, delivery_id, head_sha, state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'queued')
             ON CONFLICT (delivery_id) DO NOTHING
             RETURNING id
             """,
             (run_id, pr_url, owner, repo, pr_number, dry_run,
-             installation_id, delivery_id),
+             installation_id, delivery_id, head_sha),
         ).fetchone()
     return row["id"] if row else None
 
