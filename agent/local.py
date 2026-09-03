@@ -66,6 +66,9 @@ def review_local(repo_dir: str, diff: str, *, run_id: str = "local") -> ReviewRe
         published, payload, tally = build_review(
             list(state.get("findings") or []), diff, "local", state.get("summary") or ""
         )
+        status = state.get("status") or "running"
+        if status == "running":
+            status = "published"
         findings = []
         for i in published:
             try:
@@ -102,7 +105,7 @@ def review_local(repo_dir: str, diff: str, *, run_id: str = "local") -> ReviewRe
             tokens_out=int(state.get("tokens_out") or 0),
             wall_clock_s=round(time.monotonic() - t0, 3),
             temp_dir_removed=True,
-            status=state.get("status") or "published",
+            status=status,
             error=state.get("error"),
             corpus=list(state.get("corpus") or []),
             trace=trace,

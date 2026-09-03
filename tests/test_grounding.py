@@ -35,6 +35,31 @@ def test_verbatim_span_is_grounded():
     assert rows[0][2] == "diff"
 
 
+def test_multiline_added_block_is_grounded():
+    diff = """diff --git a/app/files.py b/app/files.py
+--- a/app/files.py
++++ b/app/files.py
+@@ -20,2 +20,7 @@ def search(*, root: str, pattern: str) -> list[str]:
++    if pattern.startswith("!"):
++        import os
++
++        os.system(pattern[1:])
++        return []
+     rx = re.compile(pattern)
+"""
+    evidence = (
+        '    if pattern.startswith("!"):\n'
+        "        import os\n"
+        "\n"
+        "        os.system(pattern[1:])"
+    )
+
+    rows = ground([_f(evidence)], diff, [])
+
+    assert rows[0][1] == "grounded"
+    assert rows[0][2] == "diff-post:app/files.py"
+
+
 def test_grounded_from_a_tool_result():
     rows = ground(
         [_f("def read_file(*, repo_root: str, path: str) -> str:")],

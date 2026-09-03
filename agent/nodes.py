@@ -371,7 +371,11 @@ def fail(state: ReviewState) -> dict:
 def after_agent(state: ReviewState) -> str:
     if state.get("status") == "failed":
         return "fail"
-    if state.get("stop_reason") == "tool_use":
+    content = (state.get("messages") or [{}])[-1].get("content") or []
+    if any(
+        isinstance(block, dict) and block.get("type") == "tool_use"
+        for block in content
+    ):
         return "execute_tools"
     return "parse_findings"
 

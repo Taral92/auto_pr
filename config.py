@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     max_diff_bytes: int = 400_000
     # Postgres
     database_url: str = "postgresql://autopr:autopr@localhost:5432/autopr"
-    db_pool_size: int = 10
+    db_pool_size: int = 5
 
     # GitHub App
     github_app_id: str = ""

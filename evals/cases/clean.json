@@ -1,9 +1,0 @@
-{
-  "id": "clean",
-  "description": "Negative control: a diff with no defect. Any published finding is a false positive. Without this you cannot tell a careful reviewer from a noisy one.",
-  "pr_url": "https://github.com/Taral92/auto_pr/pull/3",
-  "cassette": "clean",
-  "expected": [],
-  "enabled": false,
-  "note": "Enable once a no-defect PR exists. Negative control: any published finding here is a false positive."
-}

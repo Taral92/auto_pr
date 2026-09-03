@@ -5,7 +5,7 @@ services:
       POSTGRES_USER: autopr
       POSTGRES_PASSWORD: autopr
       POSTGRES_DB: autopr
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U autopr"]
@@ -17,7 +17,7 @@ services:
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://autopr:autopr@db:5432/autopr
+      DATABASE_URL: ${DATABASE_URL:-postgresql://autopr:autopr@db:5432/autopr}
     ports: ["8000:8000"]
     depends_on:
       db: {condition: service_healthy}
@@ -27,7 +27,7 @@ services:
     command: python -m worker.main
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://autopr:autopr@db:5432/autopr
+      DATABASE_URL: ${DATABASE_URL:-postgresql://autopr:autopr@db:5432/autopr}
     depends_on:
       db: {condition: service_healthy}
     # The whole point of Postgres + SKIP LOCKED: this number can go up.

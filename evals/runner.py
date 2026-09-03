@@ -3,7 +3,7 @@
     python -m evals.runner                      # all cases, replay, 1 rep
     python -m evals.runner --reps 5             # variance across runs
     python -m evals.runner --live --record      # spend tokens, save cassettes
-    python -m evals.runner --case pr-001
+    python -m evals.runner --case sandbox-escape
 
 Replay is the default on purpose. An eval you cannot afford to run is an eval
 you will not run.
@@ -20,15 +20,18 @@ from pathlib import Path
 
 from config import ROOT
 
-CASES = ROOT / "evals" / "cases"
+FIXTURES = ROOT / "evals" / "fixtures"
 
 
 def load_cases(only: str | None) -> list[dict]:
     out = []
-    for p in sorted(CASES.glob("*.json")):
-        c = json.loads(p.read_text())
-        if only is not None and only != c["id"]:
+    for fixture in sorted(p for p in FIXTURES.iterdir() if p.is_dir()):
+        if only is not None and only != fixture.name:
             continue
+        c = json.loads((fixture / "expected.json").read_text())
+        c["id"] = fixture.name
+        c["repo_dir"] = str(fixture / "repo")
+        c["diff"] = (fixture / "head.diff").read_text()
         if only is None and c.get("enabled") is False:
             continue          # explicit --case still runs a disabled case
         out.append(c)
@@ -39,11 +42,13 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
     from agent.model_client import ModelClient
     from agent.runtime import model_client_var
     from evals.scoring import Expected, breakeven_precision, net_minutes, score
-    from gh.urls import parse_pr_url
 
     mode = "record" if record else ("live" if live else "replay")
     os.environ["MODEL_MODE"] = mode
     os.environ["CASSETTE"] = case.get("cassette") or case["id"]
+    os.environ["GITHUB_TOKEN"] = ""
+    if mode == "replay":
+        os.environ["ANTHROPIC_API_KEY"] = ""
     import config
 
     config.get_settings.cache_clear()
@@ -54,12 +59,12 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
     try:
         client = ModelClient(mode=mode, cassette=case.get("cassette") or case["id"])
         tok = model_client_var.set(client)
-        from agent.review import review_pr
+        from agent.local import review_local
 
-        owner, repo, number = parse_pr_url(case["pr_url"])
-        result = review_pr(
-            owner, repo, number, config.get_settings().github_token.get_secret_value(),
-            dry_run=True,
+        result = review_local(
+            case["repo_dir"],
+            case["diff"],
+            run_id=case["id"],
         )
         findings = [f.model_dump() for f in result.findings]
         err = None
@@ -72,7 +77,7 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
         # BUG 2: only save a cassette for a run that actually completed. A
         # cassette recorded from a crashed run replays the crash forever.
         if record and client is not None and err is None:
-            client.save({"case": case["id"], "pr_url": case["pr_url"]})
+            client.save({"case": case["id"]})
 
     if err and "cassette not found" in err:
         err = "no cassette - run with --record first"

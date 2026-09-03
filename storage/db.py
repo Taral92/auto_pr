@@ -23,7 +23,11 @@ def pool() -> ConnectionPool:
             s.database_url,
             min_size=1,
             max_size=s.db_pool_size,
-            kwargs={"row_factory": dict_row, "autocommit": True},
+            kwargs={
+                "row_factory": dict_row,
+                "autocommit": True,
+                "prepare_threshold": None,
+            },
             open=True,
         )
     return _pool

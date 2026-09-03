@@ -37,8 +37,11 @@ still reviews live PRs — and the last live run read
 
 ```bash
 python -m evals.runner --record
-python -m evals.runner --reps 5
+python -m evals.runner --live --reps 5
 ```
+
+`--reps 5` in replay mode is a no-op: replay is deterministic, so repetitions
+only measure variance with `--live`.
 
 Ground truth is 2 blockers in `app/files.py`. Watch for:
 - `grounded > 0` — has never happened in a live run

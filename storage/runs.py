@@ -181,15 +181,20 @@ def record_result(run_id: str, result: Any, *, state: str) -> None:
              json.dumps(result.payload), result.error, run_id),
         )
         conn.execute("DELETE FROM findings WHERE run_id=%s", (run_id,))
-        for f in result.findings:
-            conn.execute(
-                """INSERT INTO findings (id, run_id, severity, category, path,
-                       line, title, body, evidence, verdict, anchored, posted)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (str(uuid.uuid4()), run_id, f.severity, f.category, f.path,
-                 f.line, f.title, f.body, f.evidence, f.verdict, f.anchored,
-                 f.posted),
-            )
+        finding_rows = [
+            (str(uuid.uuid4()), run_id, f.severity, f.category, f.path,
+             f.line, f.title, f.body, f.evidence, f.verdict, f.anchored,
+             f.posted)
+            for f in result.findings
+        ]
+        if finding_rows:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO findings (id, run_id, severity, category, path,
+                           line, title, body, evidence, verdict, anchored, posted)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    finding_rows,
+                )
 
 
 def get_run(run_id: str) -> dict | None:
