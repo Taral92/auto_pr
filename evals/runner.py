@@ -27,8 +27,11 @@ def load_cases(only: str | None) -> list[dict]:
     out = []
     for p in sorted(CASES.glob("*.json")):
         c = json.loads(p.read_text())
-        if only in (None, c["id"]):
-            out.append(c)
+        if only is not None and only != c["id"]:
+            continue
+        if only is None and c.get("enabled") is False:
+            continue          # explicit --case still runs a disabled case
+        out.append(c)
     return out
 
 
@@ -45,10 +48,12 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
 
     config.get_settings.cache_clear()
 
-    client = ModelClient(mode=mode, cassette=case.get("cassette") or case["id"])
-    tok = model_client_var.set(client)
     t0 = time.monotonic()
+    client = None
+    tok = None
     try:
+        client = ModelClient(mode=mode, cassette=case.get("cassette") or case["id"])
+        tok = model_client_var.set(client)
         from agent.review import review_pr
 
         owner, repo, number = parse_pr_url(case["pr_url"])
@@ -62,9 +67,15 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
         findings, err = [], f"{type(e).__name__}: {e}"
         result = None
     finally:
-        model_client_var.reset(tok)
-        if record:
+        if tok is not None:
+            model_client_var.reset(tok)
+        # BUG 2: only save a cassette for a run that actually completed. A
+        # cassette recorded from a crashed run replays the crash forever.
+        if record and client is not None and err is None:
             client.save({"case": case["id"], "pr_url": case["pr_url"]})
+
+    if err and "cassette not found" in err:
+        err = "no cassette - run with --record first"
 
     expected = [Expected(**e) for e in case["expected"]]
     s = score(findings, expected)
