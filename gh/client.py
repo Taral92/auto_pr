@@ -1,3 +1,4 @@
+import hashlib
 import json
 import ssl
 import urllib.error
@@ -35,6 +36,49 @@ def get_diff(owner: str, repo: str, number: int, token: str) -> str:
 
 
 MARKER = "<!-- auto-pr:{key} -->"
+FINDING_MARKER = "<!-- auto-pr-f:{key} -->"
+
+
+def finding_key(path: str, category: str, evidence: str) -> str:
+    """Stable id for one finding, independent of how the model worded it.
+
+    Keyed on the CODE, not the prose: the same defect gets a different title
+    and body on every run, so wording-based dedupe never fires.
+    """
+    norm = " ".join(evidence.split())
+    return hashlib.sha256(f"{path}|{category}|{norm}".encode()).hexdigest()[:12]
+
+
+def posted_finding_keys(owner: str, repo: str, number: int, token: str) -> set[str]:
+    """Every finding key already visible on this PR, from any prior review.
+
+    `already_reviewed` only tells you whether THIS exact review ran before.
+    It cannot stop two different runs from posting the same defect twice,
+    which is what happened on PR #3.
+    """
+    keys: set[str] = set()
+    for url in (
+        f"{API}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100",
+        f"{API}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100",
+    ):
+        try:
+            body, _ = _request("GET", url, token,
+                               accept="application/vnd.github+json")
+        except PermanentError:
+            continue          # cannot check -> post. A duplicate beats silence.
+        for item in json.loads(body):
+            text = item.get("body") or ""
+            start = 0
+            while True:
+                i = text.find("<!-- auto-pr-f:", start)
+                if i < 0:
+                    break
+                j = text.find(" -->", i)
+                if j < 0:
+                    break
+                keys.add(text[i + 15:j])
+                start = j
+    return keys
 
 
 def already_reviewed(owner: str, repo: str, number: int, token: str, key: str) -> bool:

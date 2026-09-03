@@ -17,6 +17,7 @@ from core.models import PublishedFinding, ReviewResult
 from gh.client import MARKER
 from gh import (
     already_reviewed,
+    posted_finding_keys,
     build_review,
     clone_head,
     get_diff,
@@ -170,15 +171,22 @@ def _finish(
             "comments": [],
         }
     else:
+        already = (
+            set() if dry_run
+            else posted_finding_keys(owner, repo, number, get_token())
+        )
         published, payload, tally = build_review(
-            items, state.get("diff") or "", state["head_sha"], summary
+            items, state.get("diff") or "", state["head_sha"], summary,
+            already=already,
         )
         # Idempotency. GitHub redelivers webhooks and Actions re-run; without
         # this one PR collects the same comments several times. The key covers
         # the prompt too, so a prompt change is legitimately a new review.
+        # Deliberately NOT keyed on prompt_sha: editing the prompt would
+        # otherwise re-review every open PR. A re-review is triggered by a
+        # new commit, which is what head_sha already covers.
         key = hashlib.sha256(
-            f"{owner}/{repo}#{number}@{state.get('head_sha')}"
-            f"~{state.get('prompt_sha')}".encode()
+            f"{owner}/{repo}#{number}@{state.get('head_sha')}".encode()
         ).hexdigest()[:16]
         payload["body"] = f"{payload.get('body','')}\n\n{MARKER.format(key=key)}".strip()
         if not dry_run:

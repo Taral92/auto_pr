@@ -229,6 +229,37 @@ def agent_step(state: ReviewState) -> dict:
     }
 
 
+def _call_sig(name: str, inp: dict) -> str:
+    """Canonical identity of a tool call: name + arguments, order-independent."""
+    return name + ":" + json.dumps(inp, sort_keys=True, default=str)
+
+
+def _prior_tool_sigs(messages: list) -> set[str]:
+    """Signatures of every tool call issued before the current turn.
+
+    The model re-requests files it already read - on a live PR it re-read one
+    file four times and burned all ten iterations, so every run degraded on the
+    iteration budget. Its result is already in the transcript, so we answer a
+    repeat with a pointer instead of the bytes: no wasted iteration, no context
+    re-inflation, and a nudge to emit findings.
+    """
+    sigs: set[str] = set()
+    for msg in messages[:-1]:
+        if msg.get("role") != "assistant":
+            continue
+        for b in msg.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                sigs.add(_call_sig(b["name"], dict(b.get("input") or {})))
+    return sigs
+
+
+_DUP_NOTE = (
+    "error: duplicate call. You already called {name} with these arguments; "
+    "its result is earlier in this conversation. Do not repeat tool calls - "
+    "use that result, or output your findings JSON now if you have enough."
+)
+
+
 def execute_tools(state: ReviewState) -> dict:
     check_cancel()
     settings = get_settings()
@@ -238,11 +269,21 @@ def execute_tools(state: ReviewState) -> dict:
     calls = []
     corpus = list(state.get("corpus") or [])
     repo_root = state["workspace"]
+    seen = _prior_tool_sigs(state["messages"])
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             continue
         name = block["name"]
         inp = dict(block.get("input") or {})
+        sig = _call_sig(name, inp)
+        if sig in seen:
+            # Answer the repeat cheaply; do not re-run the tool or grow corpus.
+            note = _DUP_NOTE.format(name=name)
+            print(f"tool {name} {inp} -> duplicate, skipped")
+            results.append((block["id"], note))
+            calls.append({"name": name, "input": inp, "result": note, "duplicate": True})
+            continue
+        seen.add(sig)
         print(f"tool {name} {inp}")
         try:
             result = DISPATCH[name](repo_root=repo_root, **inp)

@@ -105,7 +105,14 @@ def main() -> None:
     print(f"[{WORKER_ID}] up; lease={s.lease_s}s")
     try:
         while not _stop.is_set():
-            row = R.claim(lease_s=s.lease_s, worker_id=WORKER_ID)
+            try:
+                row = R.claim(lease_s=s.lease_s, worker_id=WORKER_ID)
+            except TransientError as e:
+                # A DB blip must not kill the worker. Back off and retry the
+                # claim; the pool reconnects on the next attempt.
+                print(f"[{WORKER_ID}] claim failed, retrying: {e}")
+                _stop.wait(s.poll_interval_s)
+                continue
             if row is None:
                 _stop.wait(s.poll_interval_s)
                 continue

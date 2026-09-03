@@ -7,7 +7,7 @@ Category = Literal[
     "correctness", "security", "performance", "maintainability", "test_gap"
 ]
 Verdict = Literal["grounded", "near", "ungrounded"]
-Anchored = Literal["inline", "summary", "dropped"]
+Anchored = Literal["inline", "summary", "dropped", "duplicate"]
 
 
 class Finding(BaseModel):

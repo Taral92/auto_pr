@@ -80,7 +80,7 @@ def test_grounded_finding_becomes_an_inline_comment():
         "abc123",
         "Two issues found.",
     )
-    assert tally == {"inline": 1, "summary": 0, "dropped": 0}
+    assert tally == {"inline": 1, "summary": 0, "dropped": 0, "duplicate": 0}
     assert payload["comments"][0]["path"] == "agent/tools.py"
     assert payload["comments"][0]["line"] == 18
     assert payload["comments"][0]["side"] == "RIGHT"
@@ -105,3 +105,34 @@ def test_clean_review_still_posts():
     _, payload, tally = build_review([], DIFF, "abc123", "")
     assert payload["body"] == "Reviewed, nothing found."
     assert payload["comments"] == []
+
+
+# --- cross-review dedupe: PR #3 got the same defect twice, from two runs ---
+
+def test_finding_already_on_the_pr_is_not_reposted():
+    ev = "    return Path(path).read_text()"
+    from gh.client import finding_key
+    key = finding_key("agent/tools.py", "security", ev)
+
+    _, payload, tally = build_review(
+        [_finding(ev, "grounded")], DIFF, "abc123", "s", already={key}
+    )
+    assert tally["duplicate"] == 1
+    assert tally["inline"] == 0
+    assert payload["comments"] == []
+
+
+def test_key_ignores_wording_and_whitespace():
+    """The model rewords every finding, so the key must be about the CODE."""
+    from gh.client import finding_key
+    a = finding_key("f.py", "security", "  os.system(x)  ")
+    b = finding_key("f.py", "security", "os.system(x)")
+    assert a == b
+    assert a != finding_key("f.py", "correctness", "os.system(x)")
+    assert a != finding_key("g.py", "security", "os.system(x)")
+
+
+def test_posted_comment_carries_its_key():
+    ev = "    return Path(path).read_text()"
+    _, payload, _ = build_review([_finding(ev, "grounded")], DIFF, "abc", "s")
+    assert "<!-- auto-pr-f:" in payload["comments"][0]["body"]

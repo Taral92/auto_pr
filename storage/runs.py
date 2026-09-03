@@ -16,6 +16,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import psycopg
+
+from core.errors import TransientError
+
 from .db import pool
 
 CLAIM_SQL = """
@@ -112,11 +116,18 @@ def coalesce_pr(owner: str, repo: str, pr_number: int, head_sha: str | None) -> 
 
 
 def claim(*, lease_s: int, worker_id: str) -> dict | None:
-    with pool().connection() as conn:
-        return conn.execute(
-            CLAIM_SQL,
-            {"lease": timedelta(seconds=lease_s), "worker_id": worker_id},
-        ).fetchone()
+    try:
+        with pool().connection() as conn:
+            return conn.execute(
+                CLAIM_SQL,
+                {"lease": timedelta(seconds=lease_s), "worker_id": worker_id},
+            ).fetchone()
+    except psycopg.OperationalError as e:
+        # A dropped connection - idle pooler close, network blip, DB restart -
+        # is transient, not fatal. Surface it as such so the worker backs off
+        # and retries instead of crashing the process (which permanently
+        # removes a worker, since nothing here restarts it).
+        raise TransientError(f"claim: database connection lost: {e}") from None
 
 
 def heartbeat(run_id: str, *, lease_s: int) -> None:

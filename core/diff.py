@@ -17,6 +17,12 @@ class PostImage:
             if index < 0:
                 return None
             line_index = self.text.count("\n", 0, index)
+            # post_images() builds lines from splitlines(), so a line never
+            # contains "\n" and this index is in range. The guard makes the
+            # invariant explicit rather than load-bearing and unstated: any
+            # other constructor of PostImage would crash here instead.
+            if line_index >= len(self.line_numbers):
+                return None
             line = self.line_numbers[line_index]
             if line is not None:
                 return line

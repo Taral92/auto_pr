@@ -1,4 +1,5 @@
 from core.diff import post_images
+from .client import FINDING_MARKER, finding_key
 from core.models import Finding
 
 TOO_LARGE = "Diff too large to review."
@@ -44,17 +45,28 @@ def build_review(
     diff: str,
     head_sha: str,
     summary: str,
+    already: set[str] | None = None,
 ) -> tuple[list[dict], dict, dict]:
     anchorable = parse_anchorable(diff)
     published: list[dict] = []
     comments: list[dict] = []
     summary_items: list[str] = []
+    already = already or set()
     for item in items:
         finding = Finding.model_validate(
             {k: item[k] for k in Finding.model_fields if k in item}
         )
-        body = finding_body(finding)
+        key = finding_key(finding.file, finding.category, finding.evidence)
+        body = f"{finding_body(finding)}\n\n{FINDING_MARKER.format(key=key)}"
         verdict = item.get("verdict") or "ungrounded"
+        if key in already:
+            # Same defect, different wording, already on the PR from an
+            # earlier run. `already_reviewed` cannot catch this - it only
+            # knows whether THIS review ran before.
+            published.append({**item, "path": finding.file, "line": None,
+                              "body": body, "anchored": "duplicate",
+                              "posted": False})
+            continue
         if verdict != "grounded":
             published.append(
                 {
@@ -98,7 +110,7 @@ def build_review(
                     "posted": False,
                 }
             )
-    tally = {"inline": 0, "summary": 0, "dropped": 0}
+    tally = {"inline": 0, "summary": 0, "dropped": 0, "duplicate": 0}
     for f in published:
         key = f.get("anchored")
         if key in tally:
