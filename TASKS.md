@@ -2,57 +2,83 @@
 
 ## Done
 
-1. Postgres verified against a real database — two workers, no double-claim,
-   lease recovery on `kill -9`.
-2. Hermetic evals. The runner loads `evals/fixtures/*/` and calls
-   `review_local()` — no GitHub, no token, no network. A previous live-PR eval
-   read its own answer key out of `evals/cases/`; that can no longer happen,
-   and a contamination guard test stops it regressing.
-3. First honest result, and the two bugs it surfaced:
-   - grounding could not match multi-line evidence (diff prefixes)
-   - anchoring had the same bug one layer down, so grounded findings were
-     demoted to summary
-   Both fixed by sharing one post-image parser.
+Cycle A is closed. A real GitHub webhook (`delivery_id 04765dd0-a7a3-11f1-...`)
+drove a run that posted inline comments on PR #3 as `pr-review-10x[bot]`.
+
+Postgres verified with two workers and lease recovery. Hermetic evals:
 
 ```
-sandbox-escape  tp 2  fp 0  fn 0  precision 1.0  recall 1.0
-                groundedness 1.0  inline_rate 1.0  net +24 min/PR
+no-defect        0 findings emitted        (stayed silent on correct code)
+sandbox-escape   tp 2  fp 0  precision 1.0  recall 1.0  inline_rate 1.0
 ```
 
-50 tests pass.
+## What production says that the eval cannot
 
-## 4. Ship it  ← NEXT
+Three runs on PR #3, all `budget_breach:iterations`:
 
-Nothing has ever reached GitHub. Every run so far was `--dry-run` or local.
+```
+143k in   5 grounded   4 inline
+ 89k in   1 grounded   1 inline
+106k in   3 grounded   2 inline
+```
 
-- [ ] Create the App: Contents **Read**, Pull requests **Read & write**,
-      event **Pull request**
-- [ ] `npx smee-client --url https://smee.io/<channel> --target http://localhost:8000/webhook`
-- [ ] Webhook URL → the smee channel; set a secret → `GITHUB_WEBHOOK_SECRET`
-- [ ] `base64 -i key.pem | tr -d '\n'` → `GITHUB_APP_PRIVATE_KEY`
-- [ ] Install on `auto_pr`, open a PR
+Not three judgments - three cut-off points. The agent never reaches
+`end_turn` on a real PR, so every review is work-in-progress, and that is
+the whole of the 5/1/3 spread.
 
-Verify, in this order — each catches a different failure:
+The fixture is 6 files with 1 changed. It finishes in 2-3 iterations and
+exits cleanly, so the eval cannot reproduce the only failure production has.
 
-- [ ] webhook returns 202 in under a second (it must not call the model)
-- [ ] a real **inline** comment appears on the changed line
-- [ ] push again → the older run is superseded, exactly one review exists
-- [ ] redeliver the webhook from GitHub's UI → no duplicate comment
-      (exercises `delivery_id UNIQUE` and the review-body marker)
-- [ ] `kill -9` the worker mid-review → another worker reclaims after the lease
+## 1. Tell the reader the review is partial  ← START HERE
 
-## 5. Second fixture
+`degrade()` sets `status` and `error` in state, and nothing reaches the
+review body. A human sees a confident review with no sign the agent stopped
+mid-investigation. The design rule is "publish what exists WITH THE REASON
+ATTACHED"; the reason is not attached.
 
-One fixture and two defects is not a benchmark.
+- [ ] `build_review` takes the breach reason and prefixes the body:
+      "Review stopped early (iteration budget). Findings below are partial."
+- [ ] test: a degraded review body says so; a clean one does not
 
-- [ ] a **negative control**: a diff with no defect. Any published finding is
-      a false positive. Without this you cannot tell a careful reviewer from a
-      quiet one.
-- [ ] a non-security fixture — every case so far is a security bug, where the
-      model's priors are strongest.
+## 2. Make degradation visible to the eval
 
-## 6. Deploy
+- [ ] runner reports `state` and `iterations` per case
+- [ ] a case that degrades is not scored as a clean pass
 
-Two processes, one Postgres, `/healthz` as the check. Fly.io or a VM.
-Decide whether production uses Supabase or its own Postgres; the compose `db`
-service is dev-only either way.
+## 3. A fixture big enough to fail
+
+- [ ] `evals/fixtures/wide-refactor/` - 25+ files, 4-6 changed, 2 planted
+      defects. Must reproduce `budget_breach:iterations` on today's code.
+- [ ] record it. Baseline: iterations, tokens, findings, variance over
+      `--live --reps 5`
+
+Without this, nothing below is measurable.
+
+## 4. Blast radius - the actual fix
+
+The agent spends its budget working out what to look at. Give it that up
+front instead.
+
+- [ ] parse the diff to changed files + changed symbols
+- [ ] per symbol, exact lookup: references, importers, tests naming it
+- [ ] put the ranked list in the first message; expose `find_references`,
+      `find_tests` as tools
+- [ ] grep + AST. No embeddings.
+- [ ] measure against the task 3 baseline: iterations down, `published`
+      instead of `degraded`, variance down
+
+## 5. Close cycle B - the feedback loop
+
+Nothing reads what happens to a posted comment, so `FIND_COST_MIN` stays a
+guess and "net +24 min/PR" is an assumption, not a measurement.
+
+- [ ] webhook on `pull_request_review_comment` and thread resolution
+- [ ] label each finding: dismissed / resolved-without-change / edited-then-committed
+- [ ] feed labels back into the eval corpus
+- [ ] replace the constants with observed data
+
+## Still unverified
+
+- [ ] push twice fast -> older run superseded, one review
+- [ ] redeliver from GitHub's UI -> no duplicate comment
+      (dedupe landed in 5e1e27f; confirm the PR #3 runs postdate it)
