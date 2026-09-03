@@ -1,0 +1,16 @@
+---
+description: Python conventions for this repo
+globs: ["**/*.py"]
+alwaysApply: false
+---
+
+- Python 3.12, type hints on public functions, `from __future__ import annotations`
+  where it helps.
+- Pydantic for anything crossing a boundary. `api/schemas.py` types are
+  separate from `core/models.py` domain types — never return a domain object
+  from a route.
+- psycopg 3 with `dict_row`. Parameterised queries only; no f-string SQL.
+- Comments explain WHY, especially non-obvious tradeoffs. Do not narrate what
+  the code already says.
+- No new dependency without saying what it replaces and why the stdlib will
+  not do.
