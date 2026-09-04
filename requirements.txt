@@ -1,3 +1,11 @@
 anthropic
 pydantic
+pydantic-settings
 python-dotenv
+certifi
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
+pyjwt[crypto]
+fastapi
+uvicorn[standard]

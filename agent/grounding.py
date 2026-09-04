@@ -1,5 +1,7 @@
 import re
 
+from core.diff import post_images
+
 from .models import Finding, Verdict
 
 MIN_EVIDENCE = 20
@@ -23,7 +25,11 @@ def ground(
 
     Corpus is the diff plus every tool_result. Keep grounded; caller drops the rest.
     """
-    corpus: list[tuple[str, str]] = [("diff", diff), *tool_results]
+    corpus: list[tuple[str, str]] = [
+        ("diff", diff),
+        *((f"diff-post:{image.path}", image.text) for image in post_images(diff)),
+        *tool_results,
+    ]
     out: list[tuple[Finding, Verdict, str | None]] = []
     for finding in findings:
         evidence = finding.evidence
@@ -53,3 +59,9 @@ def counts(rows: list[tuple[Finding, Verdict, str | None]]) -> dict[str, int]:
     for _, verdict, _ in rows:
         tally[verdict] += 1
     return tally
+
+
+
+
+
+

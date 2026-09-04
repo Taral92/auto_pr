@@ -1,8 +1,22 @@
 .env
-runs/
+.venv/
 __pycache__/
 *.pyc
-.venv/
+
+# local run artifacts
+runs/
+auto_pr.db
+auto_pr.db-wal
+auto_pr.db-shm
+
+.fuse_hidden*
 docs/
 fixtures/
 agent/claude.md
+handoff/
+
+# editor / OS / secrets
+.cursor/
+.DS_Store
+*.pem
+*.key

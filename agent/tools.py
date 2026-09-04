@@ -21,6 +21,25 @@ def _err(exc: BaseException) -> str:
     return f"error: {type(exc).__name__}: {exc}"
 
 
+def _resolve(repo_root: str, path: str) -> Path | None:
+    """Resolve `path` inside `repo_root`. None if it escapes the jail.
+
+    H1: both sides resolved (follows symlinks) before the containment check,
+    so a symlink pointing outside the repo is rejected, not followed.
+    """
+    root = Path(repo_root).resolve()
+    try:
+        target = (root / path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if target != root and root not in target.parents:
+        return None
+    return target
+
+
+ESCAPE = "error: path escapes the repository root and was refused"
+
+
 def _ignored(path: Path) -> bool:
     if any(part in IGNORE_DIRS for part in path.parts):
         return True
@@ -30,13 +49,15 @@ def _ignored(path: Path) -> bool:
 
 def list_files(*, repo_root: str, path: str = ".") -> str:
     try:
-        root = Path(repo_root)
-        target = root / path
+        root = Path(repo_root).resolve()
+        target = _resolve(repo_root, path)
+        if target is None:
+            return ESCAPE
         if not target.exists():
             return f"error: path not found: {path}"
         names: list[str] = []
         for p in target.rglob("*"):
-            if _ignored(p):
+            if _ignored(p) or p.is_symlink():
                 continue
             if p.is_file():
                 names.append(str(p.relative_to(root)))
@@ -49,8 +70,11 @@ def list_files(*, repo_root: str, path: str = ".") -> str:
 
 
 def read_file(*, repo_root: str, path: str) -> str:
+    target = _resolve(repo_root, path)
+    if target is None:
+        return ESCAPE
     try:
-        raw = (Path(repo_root) / path).read_bytes()
+        raw = target.read_bytes()
     except Exception as e:
         return _err(e)
     try:
@@ -79,14 +103,16 @@ def search_code(*, repo_root: str, pattern: str, path: str = ".") -> str:
     except re.error as e:
         return _err(e)
     try:
-        root = Path(repo_root)
-        target = root / path
+        root = Path(repo_root).resolve()
+        target = _resolve(repo_root, path)
+        if target is None:
+            return ESCAPE
         if not target.exists():
             return f"error: path not found: {path}"
         hits: list[str] = []
         files = [target] if target.is_file() else target.rglob("*")
         for p in files:
-            if not p.is_file() or _ignored(p):
+            if not p.is_file() or _ignored(p) or p.is_symlink():
                 continue
             try:
                 content = p.read_text(encoding="utf-8")
