@@ -20,6 +20,7 @@ class ReviewState(TypedDict, total=False):
     # context
     system_prompt: str
     prompt_sha: str
+    scope: dict[str, str]        # path -> added|modified|deleted
 
     # agent loop
     messages: list[dict]

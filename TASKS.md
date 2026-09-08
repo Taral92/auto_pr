@@ -48,21 +48,30 @@ Earlier runs degraded on a 60-file PR and we blamed repo size. Wrong: it
 degrades on 2 files too. The prompt says stay in scope and the tools let it
 leave, so searching feels productive and the budget goes.
 
-## 1. Enforce scope in the tools, not just the prompt  ← START HERE
+## 1. Enforce scope in the tools, not just the prompt — DONE
 
-- [ ] compute the changed-file set from the diff once, in state
-- [ ] `read_file` / `search_code` outside that set return
-      "<path> is not part of this diff" instead of results
-- [ ] an escape hatch for genuine dependency lookups, gated behind an
-      explicit tool (see task 3), not the general search
-- [ ] test: a tool call outside the diff returns the refusal, not content
+- [x] `core.diff.changed_paths` parses the diff once; `assemble_context`
+      puts it in state as `scope`
+- [x] `read_file` outside that set returns the refusal, naming what IS
+      readable; `search_code` walks only the changed files
+- [x] `list_files` removed - scoped it echoes the manifest, unscoped it is
+      the hole. It was iteration 1 of the failing run.
+- [x] escape hatch deferred to task 3 on purpose, not the general search
+- [x] tests: refusal not content, deleted files, path canonicalisation,
+      escape-beats-scope ordering, and the diff -> state -> tool wiring
 
-## 2. Make an empty result cost something
+## 2. Make an empty result cost something — DONE
 
 Four wasted iterations returned "" and read like normal answers.
 
-- [ ] an empty tool result says so, with iterations remaining
-- [ ] test
+- [x] `search_code` always reports what it searched, so 0 hits cannot read
+      as an answer; `is_unproductive` classifies error/refusal/no-hit
+- [x] `execute_tools` appends "[N iterations left]" to those results only -
+      never to the corpus, so a budget note can never become evidence
+- [x] test
+
+Not yet measured: today's fixtures exit in 2-3 iterations, so neither 1 nor
+2 can be scored until task 4 exists. Green tests are not evidence here.
 
 ## 3. Blast radius
 

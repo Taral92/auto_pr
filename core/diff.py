@@ -78,6 +78,34 @@ def post_images(diff: str) -> list[PostImage]:
     ]
 
 
+def changed_paths(diff: str) -> dict[str, str]:
+    """`{path: "added" | "modified" | "deleted"}`, straight from the diff headers.
+
+    The single source of truth for what this PR touches. Two things read it:
+    the manifest the model is shown, and the scope jail the tools enforce.
+    They must never disagree - a second parser would eventually drift, and the
+    symptom would be a changed file the agent is refused permission to read.
+
+    Insertion order follows the diff, so the manifest is stable across runs.
+    """
+    out: dict[str, str] = {}
+    lines = diff.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith("+++ "):
+            continue
+        new = line[4:].strip()
+        old = lines[i - 1][4:].strip() if i and lines[i - 1].startswith("--- ") else ""
+        if new == "/dev/null":
+            out[_strip_prefix(old)] = "deleted"
+        else:
+            out[_strip_prefix(new)] = "added" if old == "/dev/null" else "modified"
+    return out
+
+
+def _strip_prefix(path: str) -> str:
+    return path[2:] if path.startswith(("a/", "b/")) else path
+
+
 def _plus_path(plus_line: str) -> str | None:
     path = plus_line[4:]
     if path.startswith("b/"):

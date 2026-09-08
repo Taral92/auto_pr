@@ -4,13 +4,14 @@ import re
 import time
 
 from config import get_settings
+from core.diff import changed_paths
 from core.models import Finding, ReviewFindings
 from .graph_state import ReviewState
 from .grounding import counts as grounding_counts
 from .grounding import ground as ground_findings
 from .model_client import ModelClient
 from .runtime import check_cancel, model_client_var, trace_holder
-from .tools import DISPATCH, TOOL_SCHEMAS
+from .tools import DISPATCH, TOOL_SCHEMAS, is_unproductive
 
 SYSTEM = """You are a code reviewer. You are reviewing ONE pull request diff.
 
@@ -26,8 +27,12 @@ Do NOT report on:
 - anything you read for context but that is not part of this change
 
 The CHANGED FILES manifest in the user message tells you exactly which paths
-are in scope and whether each was added or modified. Use it. Do not try to
-work this out with search_code - it searches files on disk, not the diff.
+are in scope and whether each was added or modified. Use it.
+
+Your tools are restricted to that set: `read_file` refuses any other path, and
+`search_code` searches only the changed files. There is no way to browse the
+rest of the repository, so do not spend iterations trying. Read the changed
+files and report what is in them.
 
 If no source file is added or modified, return an empty findings list.
 An empty list is a correct answer. Padding the list is not.
@@ -124,35 +129,25 @@ def _call_model(*, system: str, messages: list, tools: list | None = None):
 
 
 def changed_files(diff: str) -> list[str]:
-    """`path (added|modified|deleted)` per file, straight from the diff headers.
+    """The manifest lines the model reads: `  path (status)`.
 
-    Without this the model burns iterations grepping for what changed, and
-    still gets added-vs-modified wrong.
+    Presentation only. `core.diff.changed_paths` does the parsing, and the
+    scope jail in `agent/tools.py` enforces the same dict, so what the model
+    is told it may read and what the tools actually allow cannot drift apart.
     """
-    out: list[str] = []
-    lines = diff.splitlines()
-    for i, line in enumerate(lines):
-        if not line.startswith("+++ "):
-            continue
-        new = line[4:].strip()
-        old = lines[i - 1][4:].strip() if i and lines[i - 1].startswith("--- ") else ""
-        if new == "/dev/null":
-            path = old[2:] if old.startswith(("a/", "b/")) else old
-            status = "deleted"
-        else:
-            path = new[2:] if new.startswith(("a/", "b/")) else new
-            status = "added" if old == "/dev/null" else "modified"
-        out.append(f"  {path} ({status})")
-    return out
+    return [f"  {path} ({status})" for path, status in changed_paths(diff).items()]
 
 
 def assemble_context(state: ReviewState) -> dict:
     check_cancel()
     system = system_prompt()
-    manifest = changed_files(state.get("diff") or "")
+    diff = state.get("diff") or ""
+    scope = changed_paths(diff)
+    manifest = [f"  {path} ({status})" for path, status in scope.items()]
     return {
         "system_prompt": system,
         "prompt_sha": hashlib.sha256(system.encode()).hexdigest(),
+        "scope": scope,
         "messages": [
             {
                 "role": "user",
@@ -242,6 +237,20 @@ def _prior_tool_sigs(messages: list) -> set[str]:
     return sigs
 
 
+def _with_budget(result: str, left: int) -> str:
+    """Attach the remaining iteration count to a result that taught nothing.
+
+    An empty or refused tool result is indistinguishable from a useful one at a
+    glance, which is how a live run spent four iterations on searches that
+    returned "" without anything looking wrong. Stating the cost makes the
+    dead end visible in the transcript the model is reading.
+    """
+    if not is_unproductive(result):
+        return result
+    turns = "iteration" if left == 1 else "iterations"
+    return f"{result}\n[{left} {turns} left in this review]"
+
+
 _DUP_NOTE = (
     "error: duplicate call. You already called {name} with these arguments; "
     "its result is earlier in this conversation. Do not repeat tool calls - "
@@ -258,6 +267,8 @@ def execute_tools(state: ReviewState) -> dict:
     calls = []
     corpus = list(state.get("corpus") or [])
     repo_root = state["workspace"]
+    scope = state.get("scope") or {}
+    left = settings.max_iterations - int(state.get("iterations") or 0)
     seen = _prior_tool_sigs(state["messages"])
     for block in content:
         if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -275,18 +286,21 @@ def execute_tools(state: ReviewState) -> dict:
         seen.add(sig)
         print(f"tool {name} {inp}")
         try:
-            result = DISPATCH[name](repo_root=repo_root, **inp)
+            result = DISPATCH[name](repo_root=repo_root, scope=scope, **inp)
         except Exception as e:
             result = f"error: {type(e).__name__}: {e}"
         print(f"preview: {result[:200]}")
         path = inp.get("path", "")
         label = f"{name}:{path}" if path else name
         # Corpus keeps the RAW text so grounding matches what the model can copy.
+        # The budget note below is not code and must never become evidence, so
+        # it is added to the message only, never to the corpus.
         corpus.append({"source": label, "text": result})
+        shown = _with_budget(result, left)
         # The model sees it fenced as untrusted data.
         results.append((
             block["id"],
-            f'<untrusted_content source="{label}">\n{result}\n</untrusted_content>',
+            f'<untrusted_content source="{label}">\n{shown}\n</untrusted_content>',
         ))
         calls.append({"name": name, "input": inp, "result": result})
     messages = list(state["messages"])
