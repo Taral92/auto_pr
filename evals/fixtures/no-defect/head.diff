@@ -1,0 +1,22 @@
+diff --git a/core/diff.py b/core/diff.py
+index 1111111..2222222 100644
+--- a/core/diff.py
++++ b/core/diff.py
+@@ -13,6 +13,19 @@ class PostImage:
+     path: str
+     text: str
+     line_numbers: tuple[int | None, ...]
++
++    def locate(self, evidence: str) -> int | None:
++        start = 0
++        while True:
++            index = self.text.find(evidence, start)
++            if index < 0:
++                return None
++            line_index = self.text.count("\n", 0, index)
++            if line_index >= len(self.line_numbers):
++                return None
++            line = self.line_numbers[line_index]
++            if line is not None:
++                return line
++            start = index + 1

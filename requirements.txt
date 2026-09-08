@@ -5,6 +5,7 @@ python-dotenv
 certifi
 langgraph
 langgraph-checkpoint-postgres
+langgraph-checkpoint-sqlite
 psycopg[binary,pool]
 pyjwt[crypto]
 fastapi

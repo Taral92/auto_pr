@@ -2,7 +2,7 @@ import re
 
 from core.diff import post_images
 
-from .models import Finding, Verdict
+from core.models import Finding, Verdict
 
 MIN_EVIDENCE = 20
 

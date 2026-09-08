@@ -3,10 +3,7 @@ import json
 import re
 import time
 
-from anthropic import APIConnectionError, APIStatusError, Anthropic
-
 from config import get_settings
-from core.errors import PermanentError, TransientError
 from core.models import Finding, ReviewFindings
 from .graph_state import ReviewState
 from .grounding import counts as grounding_counts
@@ -69,16 +66,8 @@ Reserve `blocker` for what you would block a merge over.
 Output ONLY a JSON object matching this schema. No markdown fences, no prose.
 """
 
-_TRANSIENT_HTTP = {408, 409, 429, 500, 502, 503, 504, 529}
-
-
 def system_prompt() -> str:
     return SYSTEM + json.dumps(ReviewFindings.model_json_schema())
-
-
-def _client() -> Anthropic:
-    settings = get_settings()
-    return Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.S)

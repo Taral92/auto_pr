@@ -1,22 +1,24 @@
+# secrets
 .env
+*.pem
+*.key
+
+# python
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# local run artifacts
-runs/
-auto_pr.db
-auto_pr.db-wal
-auto_pr.db-shm
+# local run artifacts (recreated on demand)
+/runs/
+auto_pr.db*
 
-.fuse_hidden*
-docs/
-fixtures/
+# local scratch
+/docs/
+/handoff/
 agent/claude.md
-handoff/
 
-# editor / OS / secrets
+# editor / OS
 .cursor/
 .DS_Store
-*.pem
-*.key
+.fuse_hidden*

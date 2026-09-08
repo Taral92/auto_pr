@@ -1,0 +1,20 @@
+{
+  "id": "sandbox-escape",
+  "description": "Hermetic case. The reviewed tree contains no eval data, so the agent cannot read its own answer key.",
+  "expected": [
+    {
+      "id": "jail-removed",
+      "path": "app/files.py",
+      "category": "security",
+      "severity": "blocker",
+      "must_contain": ["Path(path).read_text()"]
+    },
+    {
+      "id": "shell-backdoor",
+      "path": "app/files.py",
+      "category": "security",
+      "severity": "blocker",
+      "must_contain": ["os.system"]
+    }
+  ]
+}

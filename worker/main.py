@@ -13,7 +13,6 @@ import os
 import signal
 import socket
 import threading
-import time
 
 from config import get_settings
 from core.errors import BudgetExceeded, Cancelled, PermanentError, TransientError
