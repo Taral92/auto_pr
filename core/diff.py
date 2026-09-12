@@ -131,8 +131,12 @@ def changed_paths(diff: str) -> dict[str, str]:
     for i, line in enumerate(lines):
         if not line.startswith("+++ "):
             continue
-        new = line[4:].strip()
-        old = lines[i - 1][4:].strip() if i and lines[i - 1].startswith("--- ") else ""
+        new = _header_path(line[4:])
+        old = (
+            _header_path(lines[i - 1][4:])
+            if i and lines[i - 1].startswith("--- ")
+            else ""
+        )
         if new == "/dev/null":
             out[_strip_prefix(old)] = "deleted"
         else:
@@ -140,12 +144,83 @@ def changed_paths(diff: str) -> dict[str, str]:
     return out
 
 
+#: Git's C-style escapes, as `quote_c_style()` writes them.
+_C_ESCAPES = {
+    "a": 0x07, "b": 0x08, "f": 0x0C, "n": 0x0A,
+    "r": 0x0D, "t": 0x09, "v": 0x0B, '"': 0x22, "\\": 0x5C,
+}
+_OCTAL = "01234567"
+
+
+def _unquote(field: str) -> str:
+    """Decode one C-quoted git path field (leading `"` already seen).
+
+    The octal escapes are BYTES of the filename's encoding, not characters:
+    `caf\303\251.py` is 0xC3 0xA9, one `é`. They have to be reassembled into a
+    bytearray and decoded once at the end - decoding escape by escape would
+    turn every multi-byte character into mojibake. `surrogateescape` keeps a
+    filename that is not valid UTF-8 round-trippable instead of raising.
+    """
+    out = bytearray()
+    i, n = 1, len(field)
+    while i < n:
+        ch = field[i]
+        if ch == '"':                       # closing quote ends the field
+            break
+        if ch != "\\":
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            out += b"\\"
+            break
+        esc = field[i]
+        if esc in _C_ESCAPES:
+            out.append(_C_ESCAPES[esc])
+            i += 1
+        elif len(field) - i >= 3 and all(c in _OCTAL for c in field[i : i + 3]):
+            out.append(int(field[i : i + 3], 8))
+            i += 3
+        else:                               # not an escape git emits; keep it
+            out += esc.encode("utf-8")
+            i += 1
+    return out.decode("utf-8", errors="surrogateescape")
+
+
+def _header_path(field: str) -> str:
+    """The path out of a `--- ` / `+++ ` header field, still prefixed.
+
+    Two things have to be undone, and git's own rules decide both:
+
+    * Git wraps the field in double quotes and escapes it C-style whenever the
+      path contains a byte it must escape - a quote, a backslash, a control
+      character, or (with `core.quotePath`, the default) any byte >= 0x80. So a
+      PR touching `café.py` arrives as `"b/caf\303\251.py"`. Left undecoded
+      that becomes a scope key matching nothing on disk: the manifest shows the
+      model a mangled path, `read_file` refuses the real name, and the file is
+      silently unreviewable.
+    * When an UNQUOTED path contains a space, git appends a TAB after it so the
+      field stays unambiguous. The path ends at that tab. Cutting there rather
+      than stripping whitespace keeps a filename that genuinely ends in a space
+      intact - and an unquoted path can never contain a real tab, because a tab
+      is itself one of the bytes that forces quoting.
+
+    Both readings of a header go through here so `changed_paths` (which feeds
+    the scope jail) and `_plus_path` (which feeds hunk ranges and post-images)
+    cannot disagree about what a path is called.
+    """
+    if field.startswith('"'):
+        return _unquote(field)
+    return field.split("\t", 1)[0]
+
+
 def _strip_prefix(path: str) -> str:
     return path[2:] if path.startswith(("a/", "b/")) else path
 
 
 def _plus_path(plus_line: str) -> str | None:
-    path = plus_line[4:]
+    path = _header_path(plus_line[4:])
     if path.startswith("b/"):
         path = path[2:]
     return None if path == "/dev/null" else path
