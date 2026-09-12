@@ -3,10 +3,23 @@ class AutoPrError(Exception):
 
 
 class TransientError(AutoPrError):
-    """Retry with backoff: 429, 5xx, network, git timeout."""
+    """Retry with backoff: 429, 5xx, network, git timeout.
 
-    def __init__(self, message: str, *, code: int | None = None) -> None:
+    `retry_after` carries the wait the SERVICE asked for, in seconds, when it
+    said so - GitHub's `Retry-After` or `X-RateLimit-Reset`, OpenAI's
+    `Retry-After`. It is advice from the only party that knows when the limit
+    resets, so `core.backoff` prefers it over any guess of ours.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
         self.code = code
+        self.retry_after = retry_after
         super().__init__(message)
 
 

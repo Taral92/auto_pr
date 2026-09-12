@@ -1,8 +1,11 @@
 import hashlib
 import json
 import ssl
+import time
 import urllib.error
 import urllib.request
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import certifi
@@ -13,6 +16,59 @@ API = "https://api.github.com"
 USER_AGENT = "auto-pr"
 
 _TRANSIENT_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+
+#: Never trust a header to park a run for longer than this; `core.backoff`
+#: clamps again, this is just to keep an absurd value out of the error object.
+_MAX_HINT_S = 3600
+
+
+def retry_hint(headers: Any, *, now: float | None = None) -> float | None:
+    """Seconds GitHub wants us to wait, from its own headers, or None.
+
+    Three forms, in GitHub's own order of preference:
+
+    * `Retry-After` - seconds, or an HTTP date. Sent for secondary rate limits
+      and abuse detection, and it is authoritative.
+    * `X-RateLimit-Remaining: 0` plus `X-RateLimit-Reset` - the primary hourly
+      limit. The reset is an epoch second, so the wait is reset - now.
+    * Neither: None, and the caller falls back to exponential backoff.
+
+    Anything unparseable is treated as absent rather than raising: a retry hint
+    is an optimisation, and failing to read one must never turn a retryable
+    error into a crash.
+    """
+    if headers is None:
+        return None
+
+    def get(name: str) -> str | None:
+        try:
+            return headers.get(name)
+        except Exception:
+            return None
+
+    raw = get("Retry-After")
+    if raw:
+        try:
+            return max(0.0, min(float(str(raw).strip()), _MAX_HINT_S))
+        except ValueError:
+            pass
+        try:
+            stamp = parsedate_to_datetime(str(raw))
+        except (TypeError, ValueError):
+            stamp = None                 # unreadable hint is no hint
+        if stamp is not None:
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            clock = time.time() if now is None else now
+            return max(0.0, min(stamp.timestamp() - clock, _MAX_HINT_S))
+    if str(get("X-RateLimit-Remaining")).strip() == "0":
+        reset = get("X-RateLimit-Reset")
+        try:
+            clock = time.time() if now is None else now
+            return max(0.0, min(float(str(reset).strip()) - clock, _MAX_HINT_S))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def get_pr(owner: str, repo: str, number: int, token: str) -> dict[str, Any]:
@@ -168,7 +224,18 @@ def _request(
         err_body = e.read().decode("utf-8", errors="replace")
         msg = f"GitHub {e.code} {method} {url}: {err_body[:800]}"
         if e.code in _TRANSIENT_CODES:
-            raise TransientError(msg, code=e.code) from None
+            # Carry GitHub's own reset time so the worker waits that long
+            # instead of guessing - and instead of re-queueing immediately,
+            # which is how three attempts used to burn in six seconds.
+            raise TransientError(
+                msg, code=e.code, retry_after=retry_hint(e.headers)
+            ) from None
+        # A 403 carrying rate-limit headers is a limit, not an authorisation
+        # failure. GitHub uses 403 for secondary limits, and dead-lettering
+        # those would drop reviews for a condition that clears on its own.
+        hint = retry_hint(e.headers) if e.code == 403 else None
+        if hint is not None:
+            raise TransientError(msg, code=e.code, retry_after=hint) from None
         raise PermanentError(msg, code=e.code) from None
     except urllib.error.URLError as e:
         raise TransientError(f"GitHub {method} {url} failed: {e.reason}") from None

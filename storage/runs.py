@@ -24,10 +24,14 @@ from .db import pool
 
 CLAIM_SQL = """
 WITH picked AS (
-    SELECT id
+    -- prior_state travels out with the row: the UPDATE below overwrites state
+    -- with 'running', and the worker has to know whether it just claimed fresh
+    -- work or a review that is finished and only needs posting.
+    SELECT id, state AS prior_state
       FROM runs
-     WHERE state = 'queued'
-        OR (state = 'running' AND leased_until < now())   -- reclaim a dead lease
+     WHERE (state IN ('queued', 'post_pending')
+            OR (state = 'running' AND leased_until < now()))  -- dead lease
+       AND (not_before IS NULL OR not_before <= now())         -- backoff gate
      ORDER BY created_at
      FOR UPDATE SKIP LOCKED
      LIMIT 1
@@ -40,7 +44,7 @@ UPDATE runs r
        started_at   = COALESCE(r.started_at, now())
   FROM picked
  WHERE r.id = picked.id
-RETURNING r.*
+RETURNING r.*, picked.prior_state
 """
 
 
@@ -166,13 +170,55 @@ def mark(run_id: str, state: str, *, error: str | None = None) -> None:
         )
 
 
-def requeue(run_id: str, *, error: str) -> None:
+def requeue(run_id: str, *, error: str, delay_s: float = 0.0) -> None:
+    """Put a run back, optionally not before `delay_s` from now.
+
+    `not_before` is the whole backoff mechanism. Without it this set state to
+    'queued' and the next poll - two seconds later - claimed it again, so three
+    attempts were spent in about six seconds. Against a rate limit that is a
+    retry storm that asks the same question three times and gets the same
+    answer.
+    """
     with pool().connection() as conn:
         conn.execute(
             """UPDATE runs SET state='queued', leased_until=NULL,
-                               worker_id=NULL, error=%s WHERE id=%s""",
-            (error, run_id),
+                               worker_id=NULL, error=%s,
+                               not_before = now() + %s::interval
+                WHERE id=%s""",
+            (error, timedelta(seconds=max(delay_s, 0.0)), run_id),
         )
+
+
+def requeue_post(run_id: str, *, error: str, delay_s: float = 0.0) -> None:
+    """Retry only the GitHub post, keeping the computed review.
+
+    State stays `post_pending` and the payload stays in the row, so the next
+    claim re-posts instead of re-running the model. This is the difference
+    between a failed post costing one API call and costing a whole review.
+    """
+    with pool().connection() as conn:
+        conn.execute(
+            """UPDATE runs SET state='post_pending', leased_until=NULL,
+                               worker_id=NULL, error=%s,
+                               not_before = now() + %s::interval
+                WHERE id=%s""",
+            (error, timedelta(seconds=max(delay_s, 0.0)), run_id),
+        )
+
+
+def mark_posted(run_id: str, *, state: str, posted: bool) -> None:
+    """Close out a run whose post has been settled."""
+    with pool().connection() as conn, conn.transaction():
+        conn.execute(
+            """UPDATE runs SET state=%s, error=NULL, not_before=NULL,
+                               finished_at=now() WHERE id=%s""",
+            (state, run_id),
+        )
+        if posted:
+            conn.execute(
+                "UPDATE findings SET posted=TRUE WHERE run_id=%s AND anchored<>%s",
+                (run_id, "dropped"),
+            )
 
 
 def record_result(run_id: str, result: Any, *, state: str) -> None:

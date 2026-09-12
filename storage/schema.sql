@@ -25,9 +25,16 @@ CREATE TABLE IF NOT EXISTS runs (
     dry_run            BOOLEAN     NOT NULL DEFAULT FALSE,
 
     state              TEXT        NOT NULL,
-        -- queued | running | published | degraded | failed | cancelled | superseded
+        -- queued | running | post_pending | published | degraded | failed
+        -- | cancelled | superseded
+        -- post_pending: the review is COMPUTED AND PERSISTED, only the GitHub
+        -- post is outstanding. Claiming such a row re-posts; it never re-runs
+        -- the model.
     attempts           INTEGER     NOT NULL DEFAULT 0,
     leased_until       TIMESTAMPTZ,
+    not_before         TIMESTAMPTZ,   -- earliest retry; set by a delayed
+                                      -- requeue so a rate-limited run waits
+                                      -- instead of being re-claimed at once
     worker_id          TEXT,
     cancel             BOOLEAN     NOT NULL DEFAULT FALSE,
     error              TEXT,
@@ -84,3 +91,6 @@ CREATE TABLE IF NOT EXISTS findings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings (run_id);
+
+-- Idempotent migration for databases created before delayed retries existed.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;

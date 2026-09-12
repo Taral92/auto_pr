@@ -12,16 +12,41 @@ most want the old cassette to still replay.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from anthropic import APIConnectionError, APIStatusError, Anthropic
 
 from config import ROOT, get_settings
+from core.backoff import delay_for
 from core.errors import PermanentError, TransientError
 
 CASSETTE_DIR = ROOT / "evals" / "cassettes"
 TRANSIENT_HTTP = {408, 409, 429, 500, 502, 503, 504, 529}
+
+#: In-process retries of ONE model call before the error reaches the worker.
+#: Small on purpose: this covers a blip, not an outage. An outage should reach
+#: the queue, where the run waits with its completed work intact.
+MAX_CALL_RETRIES = 3
+
+
+def _openai_retry_hint(exc: Any) -> float | None:
+    """`Retry-After` off an OpenAI error response, or None.
+
+    Read defensively: the SDK's exception shape is not ours to depend on, and
+    failing to find a hint must fall back to backoff, never raise.
+    """
+    try:
+        raw = exc.response.headers.get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except ValueError:
+        return None
 
 
 class ReplayExhausted(PermanentError):
@@ -427,7 +452,14 @@ class ModelClient:
             raise PermanentError(str(e), code=e.status_code) from e
 
     def _openai(self, *, system, messages, tools, tool_choice=None):
-        """One Responses call, returned in the canonical shape."""
+        """One Responses call, returned in the canonical shape.
+
+        Transient failures are retried HERE, in process, rather than thrown back
+        to the worker. A 429 halfway through a review would otherwise abandon
+        every turn already paid for and re-run the whole thing from turn one -
+        the expensive failure mode C2 exists to remove. A permanent error still
+        propagates untouched on the first attempt.
+        """
         from openai import APIConnectionError as OpenAIConnectionError
         from openai import APIStatusError as OpenAIStatusError
         from openai import OpenAI
@@ -447,14 +479,32 @@ class ModelClient:
             kwargs["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
 
         client = OpenAI(api_key=s.openai_api_key.get_secret_value())
-        try:
-            resp = client.responses.create(**kwargs)
-        except OpenAIConnectionError as e:
-            raise TransientError(str(e)) from e
-        except OpenAIStatusError as e:
-            if e.status_code in TRANSIENT_HTTP:
-                raise TransientError(str(e), code=e.status_code) from e
-            raise PermanentError(str(e), code=e.status_code) from e
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = client.responses.create(**kwargs)
+                break
+            except OpenAIConnectionError as e:
+                transient = TransientError(str(e))
+            except OpenAIStatusError as e:
+                if e.status_code not in TRANSIENT_HTTP:
+                    # Permanent: never retried. A bad request or a rejected
+                    # key will fail identically however many times we ask.
+                    raise PermanentError(str(e), code=e.status_code) from e
+                transient = TransientError(
+                    str(e),
+                    code=e.status_code,
+                    retry_after=_openai_retry_hint(e),
+                )
+            if attempt > MAX_CALL_RETRIES:
+                raise transient
+            wait = delay_for(attempt, retry_after=transient.retry_after)
+            print(
+                f"openai {transient.code or 'network'} on attempt {attempt}; "
+                f"retrying in {wait:.1f}s"
+            )
+            time.sleep(wait)
 
         canonical = _openai_canonical(resp)
         # A reasoning model can burn the whole output allowance thinking and

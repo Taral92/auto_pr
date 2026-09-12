@@ -15,6 +15,7 @@ import socket
 import threading
 
 from config import get_settings
+from core.backoff import delay_for
 from core.errors import BudgetExceeded, Cancelled, PermanentError, TransientError
 from gh.auth import TOKENS, static_provider
 from storage import runs as R
@@ -37,8 +38,50 @@ def token_provider_for(row: dict):
     return static_provider(get_settings().github_token.get_secret_value())
 
 
+def _retry_delay(row: dict, exc: TransientError) -> float:
+    """Wait before the next attempt: the service's own hint, else backoff."""
+    return delay_for(
+        int(row.get("attempts") or 1),
+        retry_after=getattr(exc, "retry_after", None),
+    )
+
+
+def post_pending(row: dict) -> None:
+    """Post a review that is already computed and persisted.
+
+    This path never touches the model. It exists because a transient GitHub
+    failure at post time used to discard a finished review and re-run the whole
+    pipeline - paying for every turn a second and third time to answer one API
+    call that had failed.
+    """
+    from agent.review import post_payload
+
+    s = get_settings()
+    run_id = row["id"]
+    payload = row.get("payload")
+    if not payload:
+        R.mark(run_id, "failed", error="post_pending with no persisted payload")
+        return
+    try:
+        posted = post_payload(
+            row["owner"], row["repo"], row["pr_number"],
+            token_provider_for(row), payload, row.get("head_sha") or "",
+        )
+        R.mark_posted(run_id, state="published", posted=posted)
+        print(f"[{WORKER_ID}] {run_id} posted={posted} (no model work)")
+    except TransientError as e:
+        if int(row.get("attempts") or 0) < s.max_attempts:
+            wait = _retry_delay(row, e)
+            R.requeue_post(run_id, error=str(e), delay_s=wait)
+            print(f"[{WORKER_ID}] {run_id} post failed, retry in {wait:.1f}s: {e}")
+        else:
+            R.mark(run_id, "failed", error=f"post retries exhausted: {e}")
+    except PermanentError as e:
+        R.mark(run_id, "failed", error=str(e))
+
+
 def run_one(row: dict) -> None:
-    from agent.review import review_pr
+    from agent.review import post_payload, review_pr
     from agent.runtime import is_cancelled, run_id_var
 
     s = get_settings()
@@ -60,23 +103,45 @@ def run_one(row: dict) -> None:
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
     try:
+        # The model pipeline runs with post=False, so nothing reaches GitHub
+        # until the result is in the database. `record_result` is the commit
+        # point: after it, a failure costs a retried POST, never a new review.
         result = review_pr(
             row["owner"], row["repo"], row["pr_number"],
             token_provider_for(row),
             dry_run=bool(row.get("dry_run")),
+            post=False,
         )
-        R.record_result(run_id, result, state=result.status or "published")
-        print(f"[{WORKER_ID}] {run_id} {result.status} "
+        final = result.status or "published"
+        R.record_result(run_id, result, state="post_pending")
+        print(f"[{WORKER_ID}] {run_id} {final} computed and persisted "
               f"grounded={result.grounding.get('grounded')} "
               f"inline={result.anchoring.get('inline')}")
+        if result.dry_run or final == "failed":
+            R.mark_posted(run_id, state=final, posted=False)
+            return
+        try:
+            posted = post_payload(
+                row["owner"], row["repo"], row["pr_number"],
+                token_provider_for(row), result.payload,
+                result.head_sha,
+            )
+            R.mark_posted(run_id, state=final, posted=posted)
+            print(f"[{WORKER_ID}] {run_id} posted={posted}")
+        except TransientError as e:
+            wait = _retry_delay(row, e)
+            R.requeue_post(run_id, error=str(e), delay_s=wait)
+            print(f"[{WORKER_ID}] {run_id} review kept, post retry in "
+                  f"{wait:.1f}s: {e}")
     except Cancelled:
         R.mark(run_id, "cancelled")
     except BudgetExceeded as e:
         R.mark(run_id, "degraded", error=str(e))
     except TransientError as e:
         if int(row.get("attempts") or 0) < s.max_attempts:
-            R.requeue(run_id, error=str(e))
-            print(f"[{WORKER_ID}] {run_id} transient, requeued: {e}")
+            wait = _retry_delay(row, e)
+            R.requeue(run_id, error=str(e), delay_s=wait)
+            print(f"[{WORKER_ID}] {run_id} transient, retry in {wait:.1f}s: {e}")
         else:
             R.mark(run_id, "failed", error=f"retries exhausted: {e}")
     except PermanentError as e:
@@ -115,7 +180,13 @@ def main() -> None:
             if row is None:
                 _stop.wait(s.poll_interval_s)
                 continue
-            run_one(row)
+            # `prior_state` is what the row was before the claim set it to
+            # 'running'. post_pending means the review is already computed and
+            # persisted, so this claim owes GitHub a post and nothing else.
+            if row.get("prior_state") == "post_pending":
+                post_pending(row)
+            else:
+                run_one(row)
     finally:
         close_pool()
         print(f"[{WORKER_ID}] stopped")

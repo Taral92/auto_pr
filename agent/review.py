@@ -34,12 +34,52 @@ from .runtime import run_id_var, trace_holder
 PROJECT_ROOT = ROOT
 
 
+def idempotency_key(owner: str, repo: str, number: int, head_sha: str) -> str:
+    """The existing review marker key. One definition, two callers.
+
+    Deliberately NOT keyed on prompt_sha: editing the prompt would otherwise
+    re-review every open PR. A re-review comes from a new commit, which
+    head_sha already covers. `post_payload` reuses this so a retried post is
+    recognised as the same review rather than posted twice.
+    """
+    return hashlib.sha256(
+        f"{owner}/{repo}#{number}@{head_sha}".encode()
+    ).hexdigest()[:16]
+
+
+def post_payload(
+    owner: str,
+    repo: str,
+    number: int,
+    token: "str | Callable[[], str]",
+    payload: dict,
+    head_sha: str,
+) -> bool:
+    """Post an ALREADY COMPUTED review. Returns True if it posted.
+
+    This is the half of `_finish` that talks to GitHub, split out so the worker
+    can retry it against a payload it has already persisted - without running
+    the model pipeline again. Idempotency is the existing marker scheme, not a
+    new one: the body carries `MARKER.format(key=...)` and `already_reviewed`
+    looks for exactly that, so a retry after an ambiguous failure is a no-op
+    rather than a duplicate review.
+    """
+    get_token = token if callable(token) else (lambda: token)
+    key = idempotency_key(owner, repo, number, head_sha)
+    if already_reviewed(owner, repo, number, get_token(), key):
+        print(f"already reviewed {key}; skipping post")
+        return False
+    post_review(owner, repo, number, get_token(), payload)
+    return True
+
+
 def review_pr(
     owner: str,
     repo: str,
     number: int,
     token: "str | Callable[[], str]",
     dry_run: bool = False,
+    post: bool = True,
 ) -> ReviewResult:
     """`token` may be a string (CLI, PAT) or a zero-arg provider (App).
 
@@ -129,7 +169,8 @@ def review_pr(
                 },
             )
         result = _finish(
-            final, pr_url, owner, repo, number, get_token, dry_run, t0, True, trace
+            final, pr_url, owner, repo, number, get_token, dry_run, t0, True,
+            trace, post,
         )
         return result
     finally:
@@ -152,6 +193,7 @@ def _finish(
     t0: float,
     temp_dir_removed: bool,
     trace: list,
+    post: bool = True,
 ) -> ReviewResult:
     settings = get_settings()
     status = state.get("status") or "running"
@@ -180,20 +222,15 @@ def _finish(
             already=already,
         )
         # Idempotency. GitHub redelivers webhooks and Actions re-run; without
-        # this one PR collects the same comments several times.
-        # Deliberately NOT keyed on prompt_sha: editing the prompt would
-        # otherwise re-review every open PR. A re-review is triggered by a
-        # new commit, which is what head_sha already covers.
-        key = hashlib.sha256(
-            f"{owner}/{repo}#{number}@{state.get('head_sha')}".encode()
-        ).hexdigest()[:16]
+        # this one PR collects the same comments several times. See
+        # `idempotency_key` for why prompt_sha is deliberately excluded.
+        key = idempotency_key(owner, repo, number, state.get("head_sha") or "")
         payload["body"] = f"{payload.get('body','')}\n\n{MARKER.format(key=key)}".strip()
-        if not dry_run:
-            if already_reviewed(owner, repo, number, get_token(), key):
-                print(f"already reviewed {key}; skipping post")
-                status = "published"
-            else:
-                post_review(owner, repo, number, get_token(), payload)
+        # `post=False` stops here: the payload is complete and the caller
+        # persists it before anything is sent to GitHub, so a failed post costs
+        # a retry of the post and not of the whole review.
+        if post and not dry_run:
+            if post_payload(owner, repo, number, get_token, payload, key_sha(state)):
                 posted = True
                 for f in published:
                     if f.get("anchored") != "dropped":
@@ -249,6 +286,10 @@ def _finish(
     )
     _write_trace(result, trace)
     return result
+
+
+def key_sha(state) -> str:
+    return state.get("head_sha") or ""
 
 
 def _write_trace(result: ReviewResult, trace: list) -> None:
