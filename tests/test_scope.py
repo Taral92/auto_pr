@@ -7,11 +7,13 @@ tools allowed it. These tests pin the tools as the authority.
 
 import pathlib
 import tempfile
+import time
 
 import pytest
 
 from agent.tools import (
     MAX_READ_BYTES,
+    PATTERN_TOO_EXPENSIVE,
     _truncate,
     _windows,
     is_unproductive,
@@ -767,3 +769,109 @@ def test_execute_tools_passes_scope_to_the_tool(repo):
     body = out["messages"][-1]["content"][0]["content"]
     assert "is not part of this diff" in body
     assert "SECRET" not in body
+
+
+# -- search_code cannot be wedged by a model-chosen pattern -----------------
+#
+# The pattern comes from the model and the subject is untrusted repository
+# content, so catastrophic backtracking is reachable input. `re.search(r"(a+)+$",
+# "a"*40 + "b")` was measured still running after 180 seconds, and nothing would
+# have stopped it: `max_wall_clock_s` is only checked between graph nodes, and
+# the lease heartbeat keeps renewing, so the worker looks healthy while wedged.
+#
+# Two independent bounds now: a per-evaluation timeout, and a deadline for the
+# whole tool call so many individually cheap searches cannot add up.
+
+
+def _bomb_repo(root, subject="a" * 60 + "b", name="app/bomb.py"):
+    path = pathlib.Path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(subject + "\n")
+    return {name: "modified"}
+
+
+def test_a_catastrophic_pattern_returns_the_safe_error(repo):
+    """Genuinely catastrophic under the `regex` engine, not merely invalid."""
+    scope = _bomb_repo(repo)
+    out = search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+    assert out == PATTERN_TOO_EXPENSIVE
+
+
+def test_a_catastrophic_pattern_is_bounded_in_wall_clock(repo):
+    scope = _bomb_repo(repo)
+    start = time.monotonic()
+    search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+    assert time.monotonic() - start < 1.0
+
+
+def test_the_timeout_error_leaks_no_file_content(repo):
+    """A timeout must not be mistakable for evidence: it carries no source."""
+    scope = _bomb_repo(repo, subject="SECRET_MARKER_" + "a" * 60 + "b")
+    out = search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+    assert "SECRET_MARKER" not in out
+    assert "app/bomb.py" not in out
+    assert "hits" not in out
+
+
+def test_the_timeout_error_is_classified_unproductive(repo):
+    """So it advances the dead-end fuse instead of reading like an answer."""
+    scope = _bomb_repo(repo)
+    out = search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+    assert is_unproductive(out)
+
+
+def test_a_timeout_cannot_ground_a_finding(repo):
+    scope = _bomb_repo(repo)
+    out = search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+    assert _ground_against(out, out) in ("grounded", "near")   # it IS the corpus
+    # ...but it contains no code, so nothing reviewable can be quoted from it.
+    assert out.startswith("error: ")
+    assert len(out.splitlines()) == 1
+
+
+def test_a_timeout_is_deterministic(repo):
+    scope = _bomb_repo(repo)
+    outs = {search_code(repo_root=repo, scope=scope, pattern=r"(a|aa)+$")
+            for _ in range(5)}
+    assert outs == {PATTERN_TOO_EXPENSIVE}
+
+
+def test_the_overall_deadline_stops_many_cheap_searches(repo, monkeypatch):
+    """The per-search timeout bounds one evaluation; this bounds their sum."""
+    import agent.tools as T
+
+    lines = "\n".join(f"line {i}" for i in range(5000))
+    path = pathlib.Path(repo, "app/wide.py")
+    path.write_text(lines + "\n")
+    monkeypatch.setattr(T, "SEARCH_DEADLINE_S", 0.0)     # already expired
+
+    out = search_code(repo_root=repo, scope={"app/wide.py": "modified"},
+                      pattern="line")
+    assert out == T.SEARCH_DEADLINE_EXCEEDED
+    assert is_unproductive(out)
+
+
+def test_the_deadline_error_names_no_file_content(repo, monkeypatch):
+    import agent.tools as T
+
+    pathlib.Path(repo, "app/wide.py").write_text("TOPSECRET\n" * 100)
+    monkeypatch.setattr(T, "SEARCH_DEADLINE_S", 0.0)
+    out = search_code(repo_root=repo, scope={"app/wide.py": "modified"},
+                      pattern="TOPSECRET")
+    assert "TOPSECRET" not in out
+
+
+def test_a_generous_deadline_does_not_interfere(repo):
+    """The normal path must not be affected by either bound."""
+    out = search_code(repo_root=repo, scope=SCOPE, pattern="handler")
+    assert out.startswith("searched 2 changed files, 1 hit")
+    assert "app/changed.py:1:def handler():" in out
+
+
+def test_the_audit_pattern_is_no_longer_unbounded(repo):
+    """(a+)+$ is not catastrophic under `regex` - it completes immediately."""
+    scope = _bomb_repo(repo)
+    start = time.monotonic()
+    out = search_code(repo_root=repo, scope=scope, pattern=r"(a+)+$")
+    assert time.monotonic() - start < 0.5
+    assert out.startswith("searched ")          # a normal answer, not an error

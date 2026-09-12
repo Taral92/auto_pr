@@ -3,6 +3,7 @@ openai
 pydantic
 pydantic-settings
 python-dotenv
+regex
 certifi
 langgraph
 langgraph-checkpoint-postgres

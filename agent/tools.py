@@ -14,13 +14,42 @@ reported as a traversal attempt, not as an out-of-scope path.
 """
 
 import re
+import time
 from collections.abc import Mapping
 from pathlib import Path
+
+import regex
 
 from core.models import ReviewFindings
 
 MAX_READ_BYTES = 60 * 1024
 MAX_SEARCH_HITS = 50
+
+#: Wall-clock ceiling for ONE regex evaluation, in seconds.
+#:
+#: The pattern is chosen by the model and the subject is untrusted repository
+#: content, so a catastrophically backtracking pattern is reachable input, not a
+#: hypothetical. `re.search(r"(a+)+$", "a"*40 + "b")` was measured still running
+#: after 180 seconds: `max_wall_clock_s` is only consulted between graph nodes
+#: and the lease heartbeat keeps renewing, so one search could wedge a worker
+#: indefinitely while looking perfectly healthy.
+#:
+#: The `regex` package takes a per-call timeout and raises the BUILTIN
+#: TimeoutError - there is no `regex.TimeoutError`. Verified against the
+#: installed build rather than assumed.
+SEARCH_TIMEOUT_S = 0.05
+
+#: Ceiling for the whole tool call. The per-search timeout bounds one
+#: evaluation; this bounds their sum, so thousands of individually cheap
+#: searches across a wide diff cannot add up to an unbounded call.
+SEARCH_DEADLINE_S = 2.0
+
+PATTERN_TOO_EXPENSIVE = "error: pattern too expensive to evaluate; simplify it"
+
+SEARCH_DEADLINE_EXCEEDED = (
+    "error: search exceeded its time budget and was stopped; "
+    "narrow the pattern or restrict it to one file"
+)
 
 #: Lines kept either side of a hunk when a file is too big to return whole.
 #: Generous on purpose: the changed lines are already in the diff, so what a
@@ -375,8 +404,9 @@ def search_code(
     repository against rules that were never part of the change.
     """
     try:
-        rx = re.compile(pattern)
-    except re.error as e:
+        # `regex`, not `re`: only this engine can bound an evaluation.
+        rx = regex.compile(pattern)
+    except regex.error as e:
         return _err(e)
 
     root = Path(repo_root).resolve()
@@ -393,7 +423,10 @@ def search_code(
         targets = [rel]
 
     hits: list[str] = []
+    deadline = time.monotonic() + SEARCH_DEADLINE_S
     for rel in targets:
+        if time.monotonic() >= deadline:
+            return SEARCH_DEADLINE_EXCEEDED
         candidate = root / rel
         if candidate.is_symlink() or not candidate.is_file():
             continue
@@ -402,7 +435,17 @@ def search_code(
         except (UnicodeDecodeError, OSError):
             continue
         for number, line in enumerate(content.splitlines(), 1):
-            if rx.search(line):
+            if time.monotonic() >= deadline:
+                # Abandon everything: a partial hit list that reads like a
+                # complete answer is worse than a refusal the model can see.
+                return SEARCH_DEADLINE_EXCEEDED
+            try:
+                found = rx.search(line, timeout=SEARCH_TIMEOUT_S)
+            except TimeoutError:
+                # One pathological line is enough; the pattern is the problem,
+                # so trying it on the rest would only burn the deadline too.
+                return PATTERN_TOO_EXPENSIVE
+            if found:
                 hits.append(f"{rel}:{number}:{line}")
                 if len(hits) >= MAX_SEARCH_HITS:
                     return _report(len(targets), hits, capped=True)
