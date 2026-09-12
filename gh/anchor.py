@@ -1,5 +1,5 @@
 from core.diff import post_images
-from .client import FINDING_MARKER, finding_key
+from .client import FINDING_MARKER, MARKER, finding_key
 from core.models import Finding
 
 TOO_LARGE = "Diff too large to review."
@@ -31,11 +31,20 @@ def finding_body(finding: Finding) -> str:
     return "\n".join(parts).strip()
 
 
-def too_large_payload(head_sha: str) -> dict:
+def too_large_payload(head_sha: str, key: str) -> dict:
+    """The body-only notice for a diff we refuse to review.
+
+    `key` is REQUIRED, and it is the same review idempotency key the normal
+    path stamps in `_finish`. Without the marker `already_reviewed` cannot
+    recognise this review, so a retried post - or the worker's own
+    persist-then-post - reads as a first post and comments twice. Making the
+    argument mandatory is the point: there is no way to build an unmarked
+    payload here any more.
+    """
     return {
         "commit_id": head_sha,
         "event": "COMMENT",
-        "body": TOO_LARGE,
+        "body": f"{TOO_LARGE}\n\n{MARKER.format(key=key)}",
         "comments": [],
     }
 

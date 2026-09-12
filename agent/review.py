@@ -104,11 +104,20 @@ def review_pr(
         head_sha = meta["head"]["sha"]
         diff = get_diff(owner, repo, number, get_token())
         if len(diff.encode("utf-8")) > settings.max_diff_bytes:
-            payload = too_large_payload(head_sha)
+            # Same contract as the normal path below: `post=False` computes the
+            # payload and stops, so the caller persists it before anything
+            # reaches GitHub. This branch used to POST unconditionally and then
+            # report `published`, so the worker committed `post_pending` and
+            # posted the same notice a second time - and the payload carried no
+            # marker, so `already_reviewed` could not catch it either.
+            payload = too_large_payload(
+                head_sha, idempotency_key(owner, repo, number, head_sha)
+            )
             posted = False
-            if not dry_run:
-                post_review(owner, repo, number, get_token(), payload)
-                posted = True
+            if post and not dry_run:
+                posted = post_payload(
+                    owner, repo, number, get_token, payload, head_sha
+                )
             result = ReviewResult(
                 pr_url=pr_url,
                 owner=owner,
