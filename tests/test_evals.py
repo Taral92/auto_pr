@@ -103,18 +103,21 @@ def test_review_local_runs_without_accessing_evals(monkeypatch):
                 [
                     {
                         "type": "tool_use",
-                        "id": "list-1",
-                        "name": "list_files",
-                        "input": {"path": "."},
+                        "id": "read-1",
+                        "name": "read_file",
+                        "input": {"path": "app/files.py"},
                     }
                 ],
             ),
+            # Completion is a tool call now, not a JSON blob in a text block.
             _response(
-                "end_turn",
+                "tool_use",
                 [
                     {
-                        "type": "text",
-                        "text": '{"summary":"No findings.","findings":[]}',
+                        "type": "tool_use",
+                        "id": "submit-1",
+                        "name": "submit_findings",
+                        "input": {"summary": "No findings.", "findings": []},
                     }
                 ],
             ),
@@ -137,4 +140,75 @@ def test_review_local_runs_without_accessing_evals(monkeypatch):
     ]
     assert tool_calls
     assert all("evals/" not in json.dumps(call["input"]).lower() for call in tool_calls)
+    config.get_settings.cache_clear()
+
+
+def test_an_exhausted_run_is_forced_to_submit_and_marked(monkeypatch):
+    """The whole degraded path, through the real graph.
+
+    Previously this path ran the final turn's tools and threw the results
+    away unread, then reached for findings in a text block that was never
+    findings, then paid for an untracked repair call to sort it out. Now the
+    breach diverts before dispatch and one constrained, counted call ends it.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+    config.get_settings.cache_clear()
+    cap = config.get_settings().max_tokens_total
+
+    calls: list[dict] = []
+
+    def fake_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # One turn that blows the token budget and asks for a file.
+            return _Response(
+                {
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": cap, "output_tokens": 1},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "read-1",
+                            "name": "read_file",
+                            "input": {"path": "app/files.py"},
+                        }
+                    ],
+                }
+            )
+        return _Response(
+            {
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 5, "output_tokens": 2},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "submit-1",
+                        "name": "submit_findings",
+                        "input": {"summary": "Cut short.", "findings": []},
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(nodes, "_call_model", fake_call)
+    fixture = FIXTURES / "sandbox-escape"
+
+    result = review_local(
+        str(fixture / "repo"),
+        (fixture / "head.diff").read_text(),
+        run_id="test-exhausted",
+    )
+
+    assert result.status == "degraded"
+    # The breach reason survives to the end. It used to be overwritten by
+    # whatever error the parser raised on its way out.
+    assert result.error == "budget_breach:tokens"
+    # The forced call is constrained, and counted: cap + 5 in, not cap.
+    assert calls[-1]["tool_choice"] == {"type": "tool", "name": "submit_findings"}
+    assert result.tokens_in == cap + 5
+    assert result.tokens_out == 3
+    # The breached turn's read was never dispatched - nothing but the diff.
+    assert [c["source"] for c in result.corpus] == ["diff"]
+    assert result.trace[-1]["forced_submit"] == "tokens"
     config.get_settings.cache_clear()

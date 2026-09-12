@@ -31,10 +31,24 @@ def load_cases(only: str | None) -> list[dict]:
         c["id"] = fixture.name
         c["repo_dir"] = str(fixture / "repo")
         c["diff"] = (fixture / "head.diff").read_text()
+        # What this case is a case OF. Most fixtures assert findings and must
+        # finish clean; a budget fixture asserts the governor fires and is only
+        # correct when it degrades. Comparing to a per-case contract is what
+        # lets "a degraded run is not a pass" hold without making a fixture
+        # whose whole point is degrading permanently red.
+        c["expect_state"] = c.get("expect_state") or "published"
         if only is None and c.get("enabled") is False:
             continue          # explicit --case still runs a disabled case
         out.append(c)
     return out
+
+
+def cassette_name(case: dict, settings) -> str:
+    """`<case>.<provider>.<model>` - one recording per model, not per case."""
+    explicit = case.get("cassette")
+    if explicit:
+        return explicit
+    return f"{case['id']}.{settings.provider}.{settings.model}"
 
 
 def run_case(case: dict, *, live: bool, record: bool) -> dict:
@@ -44,19 +58,23 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
 
     mode = "record" if record else ("live" if live else "replay")
     os.environ["MODEL_MODE"] = mode
-    os.environ["CASSETTE"] = case.get("cassette") or case["id"]
     os.environ["GITHUB_TOKEN"] = ""
-    if mode == "replay":
-        os.environ["ANTHROPIC_API_KEY"] = ""
     import config
 
     config.get_settings.cache_clear()
+    settings = config.get_settings()
+    # Cassettes are namespaced by provider and model. A recording is a record
+    # of how ONE model behaved; replaying GPT's transcript while configured
+    # for Claude would silently score the wrong thing, and the whole point of
+    # keeping both providers is being able to compare them honestly.
+    name = cassette_name(case, settings)
+    os.environ["CASSETTE"] = name
 
     t0 = time.monotonic()
     client = None
     tok = None
     try:
-        client = ModelClient(mode=mode, cassette=case.get("cassette") or case["id"])
+        client = ModelClient(mode=mode, cassette=name)
         tok = model_client_var.set(client)
         from agent.local import review_local
 
@@ -76,7 +94,12 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
         # BUG 2: only save a cassette for a run that actually completed. A
         # cassette recorded from a crashed run replays the crash forever.
         if record and client is not None and err is None:
-            client.save({"case": case["id"]})
+            client.save({
+                "case": case["id"],
+                "provider": settings.provider,
+                "model": settings.model,
+                "reasoning_effort": getattr(settings, "reasoning_effort", None),
+            })
 
     if err and "cassette not found" in err:
         err = "no cassette - run with --record first"
@@ -89,6 +112,15 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
         "elapsed_s": round(time.monotonic() - t0, 2),
         "tokens_in": getattr(result, "tokens_in", 0) if result else 0,
         "tokens_out": getattr(result, "tokens_out", 0) if result else 0,
+        # A degraded run can still score precision 1.0 - it publishes whatever
+        # it had when the budget ran out. Reporting state and iterations next
+        # to the scores is what stops a breach from reading as a clean pass.
+        "state": (getattr(result, "status", None) if result else None) or "crashed",
+        "expect_state": case["expect_state"],
+        # Which budget went. `error` here is the graph's, not the harness's -
+        # `budget_breach:tokens` says far more than `degraded` does.
+        "detail": (getattr(result, "error", None) if result else None),
+        "iterations": getattr(result, "iterations", 0) if result else 0,
         "published": s.published,
         "tp": s.tp, "fp": s.fp, "fn": s.fn,
         "precision": round(s.precision, 3),
@@ -138,15 +170,19 @@ def main() -> None:
         by_case.setdefault(r["case"], []).append(r)
 
     print()
-    print(f"{'case':<16}{'pub':>5}{'tp':>4}{'fp':>4}{'fn':>4}"
+    print(f"{'case':<16}{'state':>11}{'iters':>7}{'pub':>5}{'tp':>4}{'fp':>4}{'fn':>4}"
           f"{'prec':>14}{'recall':>14}{'grounded':>14}"
           f"{'inline_rate':>13}{'net min':>10}")
-    print("-" * 102)
+    print("-" * 120)
     net_total = 0.0
     for cid, rows in by_case.items():
         net = statistics.mean(r["time"]["net_min"] for r in rows)
         net_total += net
-        print(f"{cid:<16}{_agg('published', rows):>5}{_agg('tp', rows):>4}"
+        want = rows[0]["expect_state"]
+        states = sorted({r["state"] for r in rows})
+        shown = "/".join(states) + ("" if states == [want] else f"!={want}")
+        print(f"{cid:<16}{shown:>11}{_agg('iterations', rows):>7}"
+              f"{_agg('published', rows):>5}{_agg('tp', rows):>4}"
               f"{_agg('fp', rows):>4}{_agg('fn', rows):>4}"
               f"{_agg('precision', rows):>14}{_agg('recall', rows):>14}"
               f"{_agg('groundedness', rows):>14}"
@@ -155,11 +191,24 @@ def main() -> None:
             if r["error"]:
                 print(f"             ERROR: {r['error']}")
                 break
-    print("-" * 102)
+    print("-" * 120)
     be = max((r["breakeven_precision"] for r in all_rows), default=0)
     print(f"net developer minutes per PR: {net_total / max(len(by_case), 1):+.1f}")
     print(f"break-even precision:         {be:.0%}   "
           f"(below this the agent costs more time than it saves)")
+
+    # A degraded run published what it happened to have when the budget blew.
+    # Scoring it as a pass is how iteration exhaustion stayed invisible for as
+    # long as it did, so it exits non-zero and says which budget went.
+    bad = [r for r in all_rows if r["state"] != r["expect_state"]]
+    if bad:
+        print()
+        for r in bad:
+            reason = r["error"] or r["detail"] or r["state"]
+            print(f"NOT A PASS  {r['case']:<16} want {r['expect_state']}, "
+                  f"got {r['state']} after {r['iterations']} iterations  {reason}")
+        print()
+        raise SystemExit(1)
     print()
 
 

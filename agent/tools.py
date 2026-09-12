@@ -17,8 +17,21 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
+from core.models import ReviewFindings
+
 MAX_READ_BYTES = 60 * 1024
 MAX_SEARCH_HITS = 50
+
+#: Lines kept either side of a hunk when a file is too big to return whole.
+#: Generous on purpose: the changed lines are already in the diff, so what a
+#: read has to supply is what surrounds them - the imports, the rest of the
+#: class, the neighbouring function that shares the invariant.
+HUNK_CONTEXT_LINES = 80
+
+OMITTED = (
+    "[lines {first}-{last} omitted ({count} lines): not changed by this diff. "
+    "search_code reaches them.]"
+)
 
 # At most this many in-scope paths are echoed in a refusal. A 60-file PR would
 # otherwise re-inflate the context on every refused call.
@@ -100,7 +113,13 @@ def _scope_error(rel: str, scope: Scope) -> str | None:
 # -- tools -----------------------------------------------------------------
 
 
-def read_file(*, repo_root: str, scope: Scope, path: str) -> str:
+def read_file(
+    *,
+    repo_root: str,
+    scope: Scope,
+    path: str,
+    hunks: Mapping[str, list[tuple[int, int]]] | None = None,
+) -> str:
     target = _resolve(repo_root, path)
     if target is None:
         return ESCAPE
@@ -118,7 +137,68 @@ def read_file(*, repo_root: str, scope: Scope, path: str) -> str:
         return _err(e)
     if len(text.encode("utf-8")) <= MAX_READ_BYTES:
         return text
-    return _truncate(text)
+    # Too big to return whole. Open it around the change instead of from the
+    # top: head-truncating this file returned 1,609 lines of generated table
+    # and cut off the only code the diff touched.
+    windows = _windows((hunks or {}).get(rel), len(text.splitlines()))
+    if not windows:
+        return _truncate(text)          # nothing to centre on; old behaviour
+    return _elide(text, windows)
+
+
+def _windows(
+    ranges: list[tuple[int, int]] | None, total: int
+) -> list[tuple[int, int]]:
+    """Hunk ranges widened by context and merged where they meet.
+
+    Merging is what stops two hunks a few lines apart from producing an
+    elision marker announcing that nothing was elided.
+    """
+    if not ranges:
+        return []
+    # A range starting past the end of the file means the diff and the
+    # checkout disagree. Drop it rather than emit an empty window.
+    widened = sorted(
+        (max(1, start - HUNK_CONTEXT_LINES), min(total, end + HUNK_CONTEXT_LINES))
+        for start, end in ranges
+        if start <= total
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in widened:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _elide(text: str, windows: list[tuple[int, int]]) -> str:
+    """The windows verbatim, with each gap replaced by a marker naming it.
+
+    The kept lines are copied exactly and carry no line-number prefix, because
+    a finding's evidence has to be a character-for-character substring of this
+    text to survive grounding. A `1234: ` prefix would make every quote fail.
+    """
+    lines = text.splitlines()
+    total = len(lines)
+    parts: list[str] = []
+    cursor = 1
+    for start, end in windows:
+        if start > cursor:
+            parts.append(
+                OMITTED.format(first=cursor, last=start - 1, count=start - cursor)
+            )
+        parts.append("\n".join(lines[start - 1 : end]))
+        cursor = end + 1
+    if cursor <= total:
+        parts.append(
+            OMITTED.format(first=cursor, last=total, count=total - cursor + 1)
+        )
+    out = "\n".join(parts)
+    # Backstop: one pathological hunk can still be bigger than the cap.
+    if len(out.encode("utf-8")) > MAX_READ_BYTES:
+        return _truncate(out)
+    return out
 
 
 def _truncate(text: str) -> str:
@@ -134,8 +214,19 @@ def _truncate(text: str) -> str:
     return "".join(out) + f"\n[truncated: {len(lines) - len(out)} more lines]"
 
 
-def search_code(*, repo_root: str, scope: Scope, pattern: str, path: str = ".") -> str:
+def search_code(
+    *,
+    repo_root: str,
+    scope: Scope,
+    pattern: str,
+    path: str = ".",
+    hunks: Mapping[str, list[tuple[int, int]]] | None = None,
+) -> str:
     """Regex over the changed files only.
+
+    `hunks` is accepted and unused, so every tool in DISPATCH takes the same
+    keywords. Searching is deliberately NOT restricted to the hunks: it is the
+    way to reach the part of a large file that `read_file` elided.
 
     Scoping the search rather than refusing it keeps the tool useful on a wide
     PR - reading every changed file can exhaust the tool-bytes budget on its
@@ -190,6 +281,50 @@ def _report(searched: int, hits: list[str], *, capped: bool = False) -> str:
 # -- budget signalling -----------------------------------------------------
 
 
+#: A line this tool added to describe what it left out, rather than a line of
+#: the file. Anchored end to end so a source line that merely starts with "["
+#: is not mistaken for one.
+_MARKER_RE = re.compile(
+    r"^\[lines \d+-\d+ omitted \(\d+ lines?\):.*\]$"
+    r"|^\[truncated: \d+ more lines?\]$"
+)
+
+
+def evidence_segments(result: str) -> list[str]:
+    """The runs of verbatim source in a tool result, with metadata removed.
+
+    The corpus is what a finding's evidence is matched against, so anything
+    in it is quotable as proof. An elision marker is not code under review -
+    it is this module talking about the code - and `[lines 1-2643 omitted
+    (2643 lines): ...]` clears the 20-character evidence minimum comfortably.
+    The marker stays in the message, where it does its job of telling the
+    model what it has not been shown; it just never becomes evidence.
+
+    Splitting rather than deleting matters. Deleting the marker would butt
+    line 2643 against line 2644 and manufacture a contiguous span that does
+    not exist in the file - closing one hole by opening a subtler one. Each
+    window is its own segment, so evidence cannot bridge the gap either.
+
+    A result with no markers is returned untouched, byte for byte, so nothing
+    about grounding on ordinary reads and searches changes.
+    """
+    lines = result.splitlines()
+    if not any(_MARKER_RE.match(line) for line in lines):
+        return [result]
+    segments: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if _MARKER_RE.match(line):
+            if current:
+                segments.append("\n".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        segments.append("\n".join(current))
+    return [segment for segment in segments if segment.strip()]
+
+
 def is_unproductive(result: str) -> bool:
     """True for a result that taught the model nothing: error, refusal, no hits.
 
@@ -214,7 +349,30 @@ def is_unproductive(result: str) -> bool:
 # echo the manifest already in the first message; unrestricted it is the hole
 # the scope jail exists to close. It was iteration 1 of the run that failed.
 
+SUBMIT_FINDINGS = "submit_findings"
+
+#: The completion tool. It is the review's exit, not a filesystem operation,
+#: so it is deliberately absent from DISPATCH - `execute_tools` intercepts it.
+#:
+#: Completion used to be inferred from the ABSENCE of a tool call, which made
+#: "the model is finished" and "the model wandered off protocol" the same
+#: event, and left a brace-matching parser plus an untracked repair call to
+#: sort out the difference. Declaring completion through a schema the API
+#: itself validates removes both.
+SUBMIT_SCHEMA = {
+    "name": SUBMIT_FINDINGS,
+    "description": (
+        "Report your review and END it. Call this once you have enough "
+        "evidence - it is the only way to finish. Every finding's `evidence` "
+        "must be copied character for character out of the diff or a tool "
+        "result. An empty findings list is a valid, correct review of code "
+        "with no defects."
+    ),
+    "input_schema": ReviewFindings.model_json_schema(),
+}
+
 TOOL_SCHEMAS = [
+    SUBMIT_SCHEMA,
     {
         "name": "read_file",
         "description": (

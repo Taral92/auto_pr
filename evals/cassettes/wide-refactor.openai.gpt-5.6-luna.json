@@ -1,0 +1,68 @@
+{
+  "meta": {
+    "case": "wide-refactor",
+    "provider": "openai",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "low"
+  },
+  "calls": [
+    {
+      "stop_reason": "tool_use",
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 851,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2691,
+        "reasoning_tokens": 187
+      },
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_SF6ybjApqvyznb3Gzoihxf9M",
+          "name": "submit_findings",
+          "input": {
+            "summary": "The new batch contract is not implemented consistently: PostgreSQL silently commits partial batches, and the reaper still calls the removed single-record API. The retry helper also does not retry.",
+            "findings": [
+              {
+                "severity": "blocker",
+                "category": "correctness",
+                "file": "store/pg.py",
+                "title": "put_many violates the all-or-nothing contract",
+                "description": "The implementation catches duplicate-key conflicts and continues processing later records, then commits the successful writes. This can leave a partially persisted batch while returning normally, directly contradicting Store's documented atomicity contract and causing callers to report the whole batch as accepted.",
+                "recommendation": "Abort the transaction and raise StoreError on the first conflict (or any write failure), allowing the transaction context to roll back all writes; remove the continue path and unused counter.",
+                "evidence": "    def put_many(self, records: list[Record]) -> None:\n        written = 0\n        with psycopg.connect(self._dsn) as conn:\n            with conn.cursor() as cur:\n                for record in records:\n                    try:\n                        self._write_one(cur, record)\n                        written += 1\n                    except _Conflict:\n                        continue\n                conn.commit()"
+              },
+              {
+                "severity": "blocker",
+                "category": "correctness",
+                "file": "jobs/reaper.py",
+                "title": "Reaper still calls the removed single-record store method",
+                "description": "Store's interface was changed from put to put_many, but sweep continues to invoke put. With the updated Store implementations this raises AttributeError instead of reaping any expired job.",
+                "recommendation": "Build records for the expired jobs and call put_many, or otherwise update the reaper to use the new batch API.",
+                "evidence": "            record = Record(key=job[\"id\"], payload=job[\"body\"].encode())\n            self._store.put(record)"
+              },
+              {
+                "severity": "should_fix",
+                "category": "correctness",
+                "file": "jobs/reaper.py",
+                "title": "sweep_with_retry never retries",
+                "description": "Despite its name and attempt parameter, this method catches an exception, sleeps once, and immediately re-raises it. A caller using this helper still gets no retry attempt, so transient store failures are not recovered.",
+                "recommendation": "Retry sweep in a bounded loop, incrementing the attempt between failures and returning on success; only re-raise after the configured retry limit.",
+                "evidence": "    def sweep_with_retry(self, jobs: list[dict], attempt: int = 0) -> int:\n        try:\n            return self.sweep(jobs)\n        except Exception:\n            time.sleep(next_delay(attempt))\n            raise"
+              },
+              {
+                "severity": "should_fix",
+                "category": "correctness",
+                "file": "store/pg.py",
+                "title": "Duplicate keys no longer produce StoreError",
+                "description": "The API explicitly translates StoreError into HTTP 409, but put_many swallows _Conflict and returns successfully. Duplicate records therefore can be reported as accepted even though they were not written.",
+                "recommendation": "Translate _Conflict into StoreError (including the conflicting key) instead of continuing, and roll back the complete batch.",
+                "evidence": "                    except _Conflict:\n                        continue\n                conn.commit()"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

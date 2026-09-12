@@ -18,7 +18,7 @@ GitHub ──webhook──► api (verify HMAC, coalesce, INSERT, 202)
         installation token ─┤ clone head SHA
                             │
                        LangGraph: assemble → agent_step ⇄ execute_tools
-                            │                → parse → ground
+                            │                → submit_findings → ground
                             ▼
                        anchor → POST review ──► GitHub
 ```
@@ -95,8 +95,16 @@ start otherwise — and a heartbeat extends it while a job runs. Too short and a
 slow review is reclaimed and posted twice; too long and a crashed worker's job
 sits stuck.
 
-**Budgets.** Iterations, tokens, wall clock, cumulative tool bytes. A breach
-degrades: publish what exists with the reason attached, never go silent.
+**Completion.** The agent finishes by calling `submit_findings`, whose schema
+the API validates. Completion used to be inferred from the absence of a tool
+call, which made "finished" and "wandered off protocol" the same event and
+left a brace-matching parser to tell them apart.
+
+**Budgets.** Tokens, wall clock and cumulative tool bytes are the work budget —
+what a review costs. Turns and consecutive dead ends are fuses: they catch a
+loop going nowhere, which costs nothing and so is invisible to the rest. A
+breach degrades: one constrained `submit_findings` call publishes what exists
+with the reason attached, never go silent.
 
 **Sandbox.** Tools are jailed to the checkout — `../`, absolute paths and
 escaping symlinks refused. Tool errors return as `tool_result` content, so a

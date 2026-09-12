@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 import re
 
-HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# Group 1 is the post-image start line, group 2 its length (absent means 1).
+# `post_images` only needs the start; `hunk_ranges` needs both, and one regex
+# for both keeps the two readings of a hunk header from drifting apart.
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,41 @@ def post_images(diff: str) -> list[PostImage]:
         for path, (lines, numbers) in files.items()
         if lines
     ]
+
+
+def hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
+    """`{path: [(first_line, last_line), ...]}` in post-image numbering.
+
+    Where in each changed file the change actually is. `read_file` uses it to
+    open a file that is too large to return whole AROUND its hunks, rather
+    than from byte zero: `store/codec.py` is 2,741 lines of which the diff
+    touches 2724-2741, and a head-truncating read returned 1,609 lines of
+    generated lookup table and none of the changed code.
+
+    Same path convention as `changed_paths`, so the keys line up with `scope`.
+    A deleted file has no post-image and is absent, as is a zero-length hunk -
+    a pure deletion covers no line that exists to be read.
+    """
+    out: dict[str, list[tuple[int, int]]] = {}
+    path: str | None = None
+    for raw in diff.splitlines():
+        if raw.startswith("diff --git "):
+            path = None
+            continue
+        if raw.startswith("+++ "):
+            path = _plus_path(raw)
+            continue
+        if not raw.startswith("@@ ") or path is None:
+            continue
+        match = HUNK_RE.match(raw)
+        if match is None:
+            continue
+        start = int(match.group(1))
+        length = int(match.group(2)) if match.group(2) is not None else 1
+        if length <= 0:
+            continue
+        out.setdefault(path, []).append((start, start + length - 1))
+    return out
 
 
 def changed_paths(diff: str) -> dict[str, str]:

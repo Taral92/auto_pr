@@ -240,6 +240,7 @@ def _finish(
         model=settings.model,
         tokens_in=int(state.get("tokens_in") or 0),
         tokens_out=int(state.get("tokens_out") or 0),
+        iterations=int(state.get("iterations") or 0),
         wall_clock_s=round(time.monotonic() - t0, 3),
         temp_dir_removed=temp_dir_removed,
         error=state.get("error"),

@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Severity = Literal["blocker", "should_fix", "nit"]
 Category = Literal[
@@ -11,6 +11,11 @@ Anchored = Literal["inline", "summary", "dropped", "duplicate"]
 
 
 class Finding(BaseModel):
+    # `extra="forbid"` emits `additionalProperties: false`, which OpenAI's
+    # strict structured-output mode requires on every object in a tool schema.
+    # Every field here is already required, which is the other precondition.
+    model_config = ConfigDict(extra="forbid")
+
     severity: Severity
     category: Category
     file: str
@@ -27,6 +32,8 @@ class Finding(BaseModel):
 
 
 class ReviewFindings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     summary: str
     findings: list[Finding]
 
@@ -63,6 +70,10 @@ class ReviewResult(BaseModel):
     model: str
     tokens_in: int
     tokens_out: int
+    # How many agent_step turns the run took. The eval scores this: a run that
+    # published the right findings on turn 9 of 10 is one prompt change away
+    # from degrading, and precision alone cannot see that.
+    iterations: int = 0
     wall_clock_s: float
     temp_dir_removed: bool
     error: str | None = None

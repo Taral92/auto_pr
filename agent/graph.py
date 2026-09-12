@@ -3,15 +3,15 @@ from langgraph.graph import END, START, StateGraph
 from .graph_state import ReviewState
 from .nodes import (
     after_agent,
-    after_parse,
+    after_forced,
     after_tools,
     agent_step,
     assemble_context,
     degrade,
     execute_tools,
     fail,
+    forced_submit,
     ground,
-    parse_findings,
 )
 
 RECURSION_LIMIT = 80
@@ -22,7 +22,7 @@ def build_graph() -> StateGraph:
     g.add_node("assemble_context", assemble_context)
     g.add_node("agent_step", agent_step)
     g.add_node("execute_tools", execute_tools)
-    g.add_node("parse_findings", parse_findings)
+    g.add_node("forced_submit", forced_submit)
     g.add_node("ground", ground)
     g.add_node("degrade", degrade)
     g.add_node("fail", fail)
@@ -35,20 +35,24 @@ def build_graph() -> StateGraph:
         {
             "fail": "fail",
             "execute_tools": "execute_tools",
-            "parse_findings": "parse_findings",
+            "forced_submit": "forced_submit",
         },
     )
     g.add_conditional_edges(
         "execute_tools",
         after_tools,
-        {"degrade": "degrade", "agent_step": "agent_step"},
+        {
+            "ground": "ground",
+            "forced_submit": "forced_submit",
+            "agent_step": "agent_step",
+        },
     )
-    g.add_edge("degrade", "parse_findings")
     g.add_conditional_edges(
-        "parse_findings",
-        after_parse,
-        {"fail": "fail", "ground": "ground"},
+        "forced_submit",
+        after_forced,
+        {"degrade": "degrade", "ground": "ground"},
     )
+    g.add_edge("degrade", "ground")
     g.add_edge("ground", END)
     g.add_edge("fail", END)
     return g

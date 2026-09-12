@@ -1,0 +1,129 @@
+diff --git a/store/base.py b/store/base.py
+index 1111111..2222222 100644
+--- a/store/base.py
++++ b/store/base.py
+@@ -18,11 +18,17 @@
+ 
+ 
+ class Store(ABC):
+-    """A record store."""
++    """A record store.
++
++    `put_many` replaced the old single-record `put`. The batch form is
++    all-or-nothing: when it returns, either every record in the batch is
++    durable or none of them are and it raised. Callers depend on that -
++    it is the reason none of them run a reconciliation pass afterwards.
++    """
+ 
+     @abstractmethod
+-    def put(self, record: Record) -> None:
+-        """Write one record. Raise StoreError if it did not land."""
++    def put_many(self, records: list[Record]) -> None:
++        """Write every record, or none of them. Raise StoreError otherwise."""
+ 
+     @abstractmethod
+     def get(self, key: str) -> Record | None:
+diff --git a/store/pg.py b/store/pg.py
+index 1111111..2222222 100644
+--- a/store/pg.py
++++ b/store/pg.py
+@@ -24,13 +24,16 @@
+         if cur.fetchone() is None:
+             raise _Conflict(record.key)
+ 
+-    def put(self, record: Record) -> None:
++    def put_many(self, records: list[Record]) -> None:
++        written = 0
+         with psycopg.connect(self._dsn) as conn:
+             with conn.cursor() as cur:
+-                try:
+-                    self._write_one(cur, record)
+-                except _Conflict as e:
+-                    raise StoreError(f"key exists: {record.key}") from e
++                for record in records:
++                    try:
++                        self._write_one(cur, record)
++                        written += 1
++                    except _Conflict:
++                        continue
+                 conn.commit()
+ 
+     def get(self, key: str) -> Record | None:
+diff --git a/store/codec.py b/store/codec.py
+index 1111111..2222222 100644
+--- a/store/codec.py
++++ b/store/codec.py
+@@ -2724,3 +2724,18 @@
+ def encode_one(name: str, value: bytes) -> bytes:
+     code, _label, width = _entry(name)
+     return bytes([code]) + value[:width].ljust(width, b"\x00")
++
++
++def encode_batch(names: list[str], values: list[bytes]) -> bytes:
++    """Encode a whole batch in one pass.
++
++    Batching replaced per-record encoding when the store moved to put_many.
++    The buffer is local to the call, so two threads encoding at once do not
++    share it; the table itself is read only after import.
++    """
++    if len(names) != len(values):
++        raise ValueError("names and values must be the same length")
++    buffer = bytearray()
++    for name, value in zip(names, values):
++        buffer += encode_one(name, value)
++    return bytes(buffer)
+diff --git a/jobs/reaper.py b/jobs/reaper.py
+index 1111111..2222222 100644
+--- a/jobs/reaper.py
++++ b/jobs/reaper.py
+@@ -5,6 +5,7 @@
+ import time
+ 
+ from store.base import Record, Store
++from .backoff import next_delay
+ 
+ 
+ class Reaper:
+@@ -19,7 +20,14 @@
+     def sweep(self, jobs: list[dict]) -> int:
+         swept = 0
+         for job in self._expired(jobs):
+-            record = Record(key=job["id"], payload=job["body"])
++            record = Record(key=job["id"], payload=job["body"].encode())
+             self._store.put(record)
+             swept += 1
+         return swept
++
++    def sweep_with_retry(self, jobs: list[dict], attempt: int = 0) -> int:
++        try:
++            return self.sweep(jobs)
++        except Exception:
++            time.sleep(next_delay(attempt))
++            raise
+diff --git a/jobs/scheduler.py b/jobs/scheduler.py
+index 1111111..2222222 100644
+--- a/jobs/scheduler.py
++++ b/jobs/scheduler.py
+@@ -14,6 +14,6 @@
+         records = [
+             Record(key=job["id"], payload=job["body"].encode()) for job in jobs
+         ]
+-        for record in records:
+-            self._store.put(record)
++        for start in range(0, len(records), self._batch):
++            self._store.put_many(records[start : start + self._batch])
+         return len(records)
+diff --git a/api/routes.py b/api/routes.py
+index 1111111..2222222 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -21,8 +21,7 @@
+         raise HTTPException(503, "store not bound")
+     records = [Record(key=i["key"], payload=i["payload"].encode()) for i in items]
+     try:
+-        for record in records:
+-            _store.put(record)
++        _store.put_many(records)
+     except StoreError as e:
+         raise HTTPException(409, str(e)) from e
+     return {"accepted": len(records)}
