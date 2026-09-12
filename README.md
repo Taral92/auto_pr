@@ -26,11 +26,34 @@ GitHub ──webhook──► api (verify HMAC, coalesce, INSERT, 202)
 The webhook never calls the model. It signs off in under a second; the worker
 does the minutes-long work. That split is the whole reason a queue exists here.
 
+## Model and provider
+
+The agent talks to **OpenAI's Responses API**, on **`gpt-5.6-luna`** with
+`REASONING_EFFORT=low`. Luna was picked by measurement: on the `wide-refactor`
+fixture it matched the larger `gpt-5.6-terra` on precision, recall,
+groundedness and anchor rate, at about a seventeenth of the cost.
+
+Both candidates are reasoning models, which is why `MAX_OUTPUT_TOKENS` (32,000)
+dwarfs the `MAX_TOKENS` ceiling the Anthropic path uses. Reasoning tokens are
+billed as output *and* counted against that limit, and can exhaust it before a
+single visible token appears — which would starve the `submit_findings` call.
+
+`PROVIDER=anthropic` switches to Claude instead. The provider boundary is
+`agent/model_client.py`: it translates either API into one canonical message
+format, so the graph, budgets, grounding, scope jail and change map are
+provider-agnostic. Both paths stay live so the same fixtures can be scored
+against either.
+
+Prompt caching needs no configuration on the OpenAI path — it is implicit above
+1,024 tokens and comes back as `cached_tokens` / `cache_write_tokens`. Those
+count toward the token budget: a cached token is cheaper, but it still occupies
+the context window and is re-sent on every turn.
+
 ## Local
 
 ```bash
 docker compose up -d db
-cp .env.example .env          # fill it in
+cp .env.example .env          # OPENAI_API_KEY and GITHUB_TOKEN at minimum
 pip install -r requirements.txt
 
 uvicorn api.main:app --port 8000
@@ -64,12 +87,13 @@ takes either a token string or a token provider.
 
 ```
 core/     domain models + error taxonomy (no I/O)
-agent/    LangGraph pipeline, tools, prompt, grounding, record/replay
+agent/    LangGraph pipeline, tools, prompt, grounding, budget, change map,
+          provider translation, record/replay
 gh/       GitHub API, App auth, webhook verification, clone, anchoring
 storage/  postgres: runs + findings
 api/      FastAPI — webhook + operator endpoints. Never runs a review.
 worker/   claims a job, runs it, records the result
-evals/    hermetic fixtures, scoring, cassettes
+evals/    hermetic fixtures, scoring, per-provider/model cassettes
 ```
 
 ## The parts that matter
@@ -86,9 +110,10 @@ Otherwise dropped.
 **Coalescing.** On a new push, queued runs for that PR are superseded and
 running ones cancelled. Cost scales with pull requests, not with pushes.
 
-**Idempotency.** A hidden marker keyed on `(repo, pr, head_sha, prompt_sha)`
-goes in the review body. Redelivery finds it and skips. A prompt change is
-legitimately a new review.
+**Idempotency.** A hidden marker keyed on `(repo, pr, head_sha)` goes in the
+review body. Redelivery finds it and skips. `prompt_sha` is deliberately *not*
+in the key — editing the prompt would otherwise re-review every open PR. A new
+review comes from a new commit, which `head_sha` already covers.
 
 **Leases.** `LEASE_S` must exceed `MAX_WALL_CLOCK_S` — the worker refuses to
 start otherwise — and a heartbeat extends it while a job runs. Too short and a
@@ -106,6 +131,25 @@ loop going nowhere, which costs nothing and so is invisible to the rest. A
 breach degrades: one constrained `submit_findings` call publishes what exists
 with the reason attached, never go silent.
 
+**Bounded reads.** A file under the read cap comes back whole. Over it,
+`read_file` returns windows around the diff's own hunks — 80 lines either side,
+merged where they overlap, each gap replaced by a marker naming the omitted line
+range. Head-truncating from byte zero once returned 1,609 lines of a generated
+lookup table and cut off the only code the diff changed. The byte cap remains as
+a backstop for a single enormous hunk, and a changed file with no hunks falls
+back to truncation.
+
+**Change map.** Before the first model turn, a deterministic pass over the
+checkout works out what the diff touches: the changed symbols (AST definitions
+intersected with the hunk ranges) and, for files that import a changed module,
+where those symbols are defined, used, or named by a test. It is sorted and
+bounded, so one diff always yields one map, and it rides in the first user
+message inside the cached prefix. Python only today; other languages degrade to
+an empty map. It *reports* paths outside the diff without making them readable,
+so the scope jail is unchanged — and it is triage information, never evidence:
+the map lives in the message and never in the corpus, so nothing quoted from it
+can ground a finding.
+
 **Sandbox.** Tools are jailed to the checkout — `../`, absolute paths and
 escaping symlinks refused. Tool errors return as `tool_result` content, so a
 bad regex costs one iteration rather than the run. Model-chosen tool calls run
@@ -118,6 +162,10 @@ python -m evals.runner              # replay — free, offline, deterministic
 python -m evals.runner --record     # calls the API, saves cassettes
 python -m evals.runner --reps 5     # variance
 ```
+
+Cassettes are namespaced `<case>.<provider>.<model>`, because a recording is a
+record of how one model behaved — replaying one model's transcript while
+configured for another would score the wrong thing.
 
 Two questions, measured separately:
 

@@ -180,8 +180,7 @@ def _finish(
             already=already,
         )
         # Idempotency. GitHub redelivers webhooks and Actions re-run; without
-        # this one PR collects the same comments several times. The key covers
-        # the prompt too, so a prompt change is legitimately a new review.
+        # this one PR collects the same comments several times.
         # Deliberately NOT keyed on prompt_sha: editing the prompt would
         # otherwise re-review every open PR. A re-review is triggered by a
         # new commit, which is what head_sha already covers.
