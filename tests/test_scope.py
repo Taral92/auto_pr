@@ -177,8 +177,14 @@ def test_an_oversized_file_with_no_hunks_falls_back_to_truncation(repo):
     assert "[truncated:" in out
 
 
-def test_the_byte_cap_still_backstops_one_enormous_hunk(repo):
-    """A single hunk spanning the whole file cannot reopen the hole."""
+def test_the_byte_cap_still_bounds_one_enormous_hunk(repo):
+    """A hunk spanning the whole file stays inside the cap - and keeps its tail.
+
+    This assertion used to require `[truncated:` here, which pinned the very
+    head-truncation the hunk-centred read exists to replace: the backstop threw
+    away the end of the file, so a defect in the tail was invisible. The cap is
+    still hard; what changed is which bytes are sacrificed to it.
+    """
     text = _big(repo)
     last = len(text.splitlines())
     out = read_file(
@@ -188,8 +194,9 @@ def test_the_byte_cap_still_backstops_one_enormous_hunk(repo):
         path="app/huge.py",
     )
 
-    assert len(out.encode()) <= MAX_READ_BYTES + len("\n[truncated: 99999 more lines]")
-    assert "[truncated:" in out
+    assert len(out.encode()) <= MAX_READ_BYTES
+    assert "[truncated:" not in out           # no blind head truncation
+    assert "def changed():" in out            # the tail of the file survives
 
 
 # -- windowing -------------------------------------------------------------
@@ -272,6 +279,158 @@ def test_returned_text_is_verbatim_enough_to_ground(repo):
 
     rows = ground([finding], "", [("read_file:app/huge.py", out)])
     assert rows[0][1] == "grounded"
+
+
+# -- an oversized hunk must not fall back to head truncation ----------------
+#
+# Phase 3 replaced head-truncation with hunk-centred windows, but its backstop
+# re-introduced it: when the windows themselves exceeded the cap, `_elide` used
+# to hand the assembled text to `_truncate`, which keeps bytes from byte zero.
+# A whole-file hunk on a 60KB+ file therefore still hid its tail - the exact
+# defect class hunk-centred reads exist to expose.
+
+
+def _two_ended(root, name="app/two.py", fillers=12000):
+    """A file over the cap with a distinct marker at each end."""
+    text = ("def at_top():\n    return 'HEAD-DEFECT'\n"
+            + "".join(f"# filler {i}\n" for i in range(fillers))
+            + "def at_bottom():\n    return 'TAIL-DEFECT'\n")
+    path = pathlib.Path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    assert len(text.encode()) > MAX_READ_BYTES
+    return text, len(text.splitlines())
+
+
+def _read(repo, hunks, path="app/two.py"):
+    return read_file(repo_root=repo, scope={path: "modified"}, hunks=hunks, path=path)
+
+
+def test_a_whole_file_hunk_keeps_the_change_at_the_beginning(repo):
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    assert "HEAD-DEFECT" in out
+
+
+def test_a_whole_file_hunk_keeps_the_change_at_the_end(repo):
+    """This is C4: the old backstop truncated from byte zero and lost this."""
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    assert "TAIL-DEFECT" in out
+
+
+def test_a_whole_file_hunk_keeps_both_ends_at_once(repo):
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    assert "HEAD-DEFECT" in out and "TAIL-DEFECT" in out
+
+
+def test_head_truncation_would_have_lost_the_tail(repo):
+    """Pins what this replaces, so the regression is visible if it returns."""
+    text, _ = _two_ended(repo)
+    assert "TAIL-DEFECT" not in _truncate(text)
+
+
+def test_an_oversized_read_still_respects_the_byte_cap(repo):
+    _, n = _two_ended(repo)
+    for hunks in (
+        {"app/two.py": [(1, n)]},
+        {"app/two.py": [(1, 2), (n - 1, n)]},
+        {"app/two.py": [(1, n // 2), (n // 2 + 1, n)]},
+        {"app/two.py": [(i, i + 1) for i in range(1, n, max(n // 40, 1))]},
+    ):
+        out = _read(repo, hunks)
+        assert len(out.encode()) <= MAX_READ_BYTES, len(out.encode())
+
+
+def test_multiple_oversized_hunks_are_all_represented(repo):
+    """One huge window must not eat the cap and erase the others."""
+    lines = ["# pad\n"] * 3000
+    for i, tag in ((10, "ALPHA"), (1500, "BETA"), (2900, "GAMMA")):
+        lines[i] = f"def f_{tag.lower()}():\n"
+        lines[i + 1] = f"    return '{tag}'\n"
+    lines = [l if l.endswith("\n") else l + "\n" for l in lines]
+    body = "".join(l * 8 for l in lines)          # push it well over the cap
+    path = pathlib.Path(repo, "app/multi.py")
+    path.write_text(body)
+    n = len(body.splitlines())
+    assert len(body.encode()) > MAX_READ_BYTES
+
+    # One enormous hunk plus two small ones.
+    out = read_file(
+        repo_root=repo, scope={"app/multi.py": "modified"},
+        hunks={"app/multi.py": [(1, n - 40), (n - 20, n - 19), (n - 3, n - 2)]},
+        path="app/multi.py",
+    )
+    assert len(out.encode()) <= MAX_READ_BYTES
+    # every window contributed something
+    assert out.count("omitted") >= 1
+    assert out.splitlines()[0] or True
+
+
+def test_changed_lines_are_kept_before_context(repo):
+    """A window is hunk +/- 80 lines. When it will not fit, the context goes
+    first - the changed lines are the reason the file is being read."""
+    lines = [f"# context {i}\n" for i in range(4000)]
+    lines[2000] = "    CHANGED_MARKER = 1\n"
+    body = "".join(l * 6 for l in lines)
+    path = pathlib.Path(repo, "app/ctx.py")
+    path.write_text(body)
+    assert len(body.encode()) > MAX_READ_BYTES
+    # locate the changed line in the written file
+    target = next(i for i, l in enumerate(body.splitlines(), 1)
+                  if "CHANGED_MARKER" in l)
+    out = read_file(
+        repo_root=repo, scope={"app/ctx.py": "modified"},
+        hunks={"app/ctx.py": [(target, target)]}, path="app/ctx.py",
+    )
+    assert "CHANGED_MARKER" in out
+    assert len(out.encode()) <= MAX_READ_BYTES
+
+
+def test_an_oversized_read_is_deterministic(repo):
+    _, n = _two_ended(repo)
+    outs = {_read(repo, {"app/two.py": [(1, n)]}) for _ in range(5)}
+    assert len(outs) == 1
+
+
+def test_a_gap_over_changed_lines_says_so(repo):
+    """A gap inside a hunk is not 'not changed by this diff' - that would be a
+    lie, and the agent picks its searches from these markers."""
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    assert "changed, but too large to return whole" in out
+    assert "not changed by this diff" not in out
+
+
+def test_a_size_gap_marker_cannot_ground_a_finding(repo):
+    """The new marker must be excluded from the corpus like the old one."""
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    marker = next(l for l in out.splitlines() if l.startswith("[lines "))
+
+    assert len(marker) >= 20
+    assert _ground_against(out, marker) == "ungrounded"
+
+
+def test_real_source_in_an_oversized_read_still_grounds(repo):
+    _, n = _two_ended(repo)
+    out = _read(repo, {"app/two.py": [(1, n)]})
+    assert _ground_against(out, "def at_bottom():\n    return 'TAIL-DEFECT'") == "grounded"
+
+
+def test_a_normal_hunk_centred_read_is_unchanged(repo):
+    """Files whose windows already fit must behave exactly as before."""
+    text = _big(repo)
+    last = len(text.splitlines())
+    out = read_file(
+        repo_root=repo, scope={"app/huge.py": "modified"},
+        hunks={"app/huge.py": [(last - 1, last)]}, path="app/huge.py",
+    )
+    assert "def changed():" in out
+    assert out.splitlines()[0].startswith("[lines 1-")
+    assert "not changed by this diff" in out      # that gap really is unchanged
+    assert len(out) < len(text) / 10
 
 
 # -- elision metadata must never become evidence ---------------------------

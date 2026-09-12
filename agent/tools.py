@@ -33,6 +33,20 @@ OMITTED = (
     "search_code reaches them.]"
 )
 
+#: A gap that the diff DOES touch, dropped only because the windows together
+#: exceed the byte cap. Worded differently from OMITTED because "not changed by
+#: this diff" would be a lie about these lines, and the agent decides what to
+#: search for from these markers.
+ELIDED = (
+    "[lines {first}-{last} omitted ({count} lines): changed, but too large to "
+    "return whole. search_code reaches them.]"
+)
+
+#: Bytes held back per possible marker when dividing the cap. One marker is
+#: ~100 bytes; this is deliberately loose so the assembled output cannot creep
+#: over MAX_READ_BYTES.
+MARKER_BUDGET = 160
+
 # At most this many in-scope paths are echoed in a refusal. A 60-file PR would
 # otherwise re-inflate the context on every refused call.
 MAX_SCOPE_LISTED = 10
@@ -140,10 +154,11 @@ def read_file(
     # Too big to return whole. Open it around the change instead of from the
     # top: head-truncating this file returned 1,609 lines of generated table
     # and cut off the only code the diff touched.
-    windows = _windows((hunks or {}).get(rel), len(text.splitlines()))
+    ranges = (hunks or {}).get(rel)
+    windows = _windows(ranges, len(text.splitlines()))
     if not windows:
         return _truncate(text)          # nothing to centre on; old behaviour
-    return _elide(text, windows)
+    return _elide(text, windows, ranges or [])
 
 
 def _windows(
@@ -172,33 +187,159 @@ def _windows(
     return merged
 
 
-def _elide(text: str, windows: list[tuple[int, int]]) -> str:
-    """The windows verbatim, with each gap replaced by a marker naming it.
+def _nbytes(lines: list[str]) -> int:
+    """Bytes that `"\n".join(lines)` will occupy."""
+    if not lines:
+        return 0
+    return sum(len(line.encode("utf-8")) for line in lines) + len(lines) - 1
+
+
+def _core(ranges: list[tuple[int, int]], start: int, end: int) -> tuple[int, int]:
+    """The span inside this window that the diff actually changed.
+
+    A window is a hunk widened by HUNK_CONTEXT_LINES, so when a window has to
+    be cut the context is what should go first - the changed lines are the
+    whole reason the file is being read.
+    """
+    inside = [(s, e) for s, e in ranges if s <= end and e >= start]
+    if not inside:
+        return start, end
+    return max(start, min(s for s, _ in inside)), min(end, max(e for _, e in inside))
+
+
+def _fair_share(sizes: list[int], budget: int) -> list[int]:
+    """Max-min fair split of `budget`: small windows get all they need, the
+    rest divide what is left equally.
+
+    Without this one enormous window eats the whole cap and every other hunk
+    in the file disappears. Ties break on index, so the split is deterministic
+    for a given input.
+    """
+    shares = [0] * len(sizes)
+    remaining, left = budget, len(sizes)
+    for i in sorted(range(len(sizes)), key=lambda i: (sizes[i], i)):
+        take = min(sizes[i], remaining // left) if left else 0
+        shares[i] = take
+        remaining -= take
+        left -= 1
+    return shares
+
+
+def _split(lines: list[str], first: int, last: int, budget: int) -> list[tuple[int, int]]:
+    """Keep BOTH ends of an over-budget span, dropping the middle.
+
+    This is the case the old backstop got wrong: it head-truncated, so a defect
+    in the tail of a whole-file hunk was invisible. A defect is no likelier at
+    the top of a file than the bottom.
+    """
+    room = max(budget - MARKER_BUDGET, 0)
+    head_end, tail_start = first - 1, last + 1
+    head_bytes = tail_bytes = 0
+    i, j = first, last
+    while i <= j:
+        took = False
+        if head_bytes <= tail_bytes:
+            size = len(lines[i - 1].encode("utf-8")) + 1
+            if head_bytes + tail_bytes + size <= room:
+                head_end, head_bytes, i, took = i, head_bytes + size, i + 1, True
+        if not took and i <= j:
+            size = len(lines[j - 1].encode("utf-8")) + 1
+            if head_bytes + tail_bytes + size <= room:
+                tail_start, tail_bytes, j, took = j, tail_bytes + size, j - 1, True
+        if not took:
+            break
+    kept = []
+    if head_end >= first:
+        kept.append((first, head_end))
+    if tail_start <= last:
+        kept.append((tail_start, last))
+    return kept or [(first, first)]      # always show at least one changed line
+
+
+def _pick(
+    lines: list[str], window: tuple[int, int], core: tuple[int, int], budget: int
+) -> list[tuple[int, int]]:
+    """Which lines of one window survive its share of the cap."""
+    start, end = window
+    if _nbytes(lines[start - 1 : end]) <= budget:
+        return [window]
+    first, last = core
+    if _nbytes(lines[first - 1 : last]) > budget:
+        return _split(lines, first, last, budget)
+    # The changed lines fit; spend what is left growing context outward.
+    lo, hi = first, last
+    size = _nbytes(lines[lo - 1 : hi])
+    while lo > start or hi < end:
+        grew = False
+        if lo > start:
+            above = len(lines[lo - 2].encode("utf-8")) + 1
+            if size + above <= budget:
+                lo, size, grew = lo - 1, size + above, True
+        if hi < end:
+            below = len(lines[hi].encode("utf-8")) + 1
+            if size + below <= budget:
+                hi, size, grew = hi + 1, size + below, True
+        if not grew:
+            break
+    return [(lo, hi)]
+
+
+def _select(
+    lines: list[str], windows: list[tuple[int, int]], ranges: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Line ranges to return, inside the byte cap, hunks prioritised."""
+    reserve = min(MARKER_BUDGET * (2 * len(windows) + 2), MAX_READ_BYTES // 2)
+    budget = MAX_READ_BYTES - reserve
+    sizes = [_nbytes(lines[s - 1 : e]) for s, e in windows]
+    kept: list[tuple[int, int]] = []
+    for window, share in zip(windows, _fair_share(sizes, budget)):
+        kept.extend(_pick(lines, window, _core(ranges, *window), share))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(kept):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _gap(first: int, last: int, ranges: list[tuple[int, int]]) -> str:
+    changed = any(s <= last and e >= first for s, e in ranges)
+    template = ELIDED if changed else OMITTED
+    return template.format(first=first, last=last, count=last - first + 1)
+
+
+def _elide(
+    text: str, windows: list[tuple[int, int]], ranges: list[tuple[int, int]]
+) -> str:
+    """The surviving lines verbatim, with each gap replaced by a marker.
 
     The kept lines are copied exactly and carry no line-number prefix, because
     a finding's evidence has to be a character-for-character substring of this
     text to survive grounding. A `1234: ` prefix would make every quote fail.
+
+    There is no head-truncating backstop any more. When the windows do not fit,
+    `_select` decides what to drop - context before changed lines, and the
+    middle of a span before either of its ends - so the output stays inside
+    MAX_READ_BYTES without the tail of a changed file silently vanishing.
     """
     lines = text.splitlines()
     total = len(lines)
     parts: list[str] = []
     cursor = 1
-    for start, end in windows:
+    for start, end in _select(lines, windows, ranges):
         if start > cursor:
-            parts.append(
-                OMITTED.format(first=cursor, last=start - 1, count=start - cursor)
-            )
+            parts.append(_gap(cursor, start - 1, ranges))
         parts.append("\n".join(lines[start - 1 : end]))
         cursor = end + 1
     if cursor <= total:
-        parts.append(
-            OMITTED.format(first=cursor, last=total, count=total - cursor + 1)
-        )
-    out = "\n".join(parts)
-    # Backstop: one pathological hunk can still be bigger than the cap.
-    if len(out.encode("utf-8")) > MAX_READ_BYTES:
-        return _truncate(out)
-    return out
+        parts.append(_gap(cursor, total, ranges))
+    # Last resort for a file with hundreds of separate hunks, where the markers
+    # alone approach the cap: drop whole trailing parts. Never a partial line,
+    # and never the front-of-file bias the old backstop had.
+    while len("\n".join(parts).encode("utf-8")) > MAX_READ_BYTES and len(parts) > 1:
+        parts.pop()
+    return "\n".join(parts)
 
 
 def _truncate(text: str) -> str:
