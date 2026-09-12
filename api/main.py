@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from storage.db import close_pool, init_db
 
-from .routes import router
+from .routes import operator, router
 
 
 @asynccontextmanager
@@ -15,4 +15,5 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="auto-pr", lifespan=lifespan)
-app.include_router(router)
+app.include_router(router)        # public: /webhook, /healthz
+app.include_router(operator)      # gated: everything under /api

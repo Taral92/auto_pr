@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr = SecretStr("")
     openai_api_key: SecretStr = SecretStr("")
     github_token: SecretStr
+
+    # Shared secret for the operator API under /api. Unset means that API is
+    # disabled outright - see api/auth.py. The webhook does not use this; it
+    # authenticates per-request with an HMAC over the body.
+    operator_secret: SecretStr = SecretStr("")
     # Cost is the primary constraint, so the default is the cheapest tier that
     # can run this agent: $0.20/$0.02/$1.20 per 1M in/cached/out, a tenth of
     # gpt-5.6-terra. Move up a tier only if the evals show Luna missing

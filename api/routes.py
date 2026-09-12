@@ -1,6 +1,6 @@
 import json
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from config import get_settings
 from gh.urls import parse_pr_url
@@ -8,6 +8,7 @@ from gh.webhook import HEADER, should_review, verify
 from storage import runs as R
 from storage.db import health
 
+from .auth import require_operator
 from .schemas import (
     CancelOut,
     FindingOut,
@@ -19,6 +20,13 @@ from .schemas import (
 )
 
 router = APIRouter()
+
+# Everything under /api is operator-only. The dependency sits on the ROUTER, not
+# on each route, so a route added here later is protected by default instead of
+# by somebody remembering. The webhook and /healthz stay on `router` above and
+# remain public - the webhook because GitHub must reach it, and it authenticates
+# itself with an HMAC over the body.
+operator = APIRouter(prefix="/api", dependencies=[Depends(require_operator)])
 
 
 # --------------------------------------------------------------------------
@@ -91,7 +99,7 @@ def _summary(d: dict) -> RunSummary:
     return RunSummary(**{k: d.get(k) for k in RunSummary.model_fields})
 
 
-@router.post("/api/review", response_model=ReviewAccepted, status_code=202)
+@operator.post("/review", response_model=ReviewAccepted, status_code=202)
 def create_review(body: ReviewRequest) -> ReviewAccepted:
     try:
         owner, repo, number = parse_pr_url(body.pr_url)
@@ -104,12 +112,12 @@ def create_review(body: ReviewRequest) -> ReviewAccepted:
     return ReviewAccepted(run_id=run_id)
 
 
-@router.get("/api/runs", response_model=list[RunSummary])
+@operator.get("/runs", response_model=list[RunSummary])
 def get_runs(limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
     return [_summary(r) for r in R.list_runs(limit=limit, cursor=cursor)]
 
 
-@router.get("/api/runs/{run_id}", response_model=RunDetail)
+@operator.get("/runs/{run_id}", response_model=RunDetail)
 def get_run_detail(run_id: str) -> RunDetail:
     row = R.get_run(run_id)
     if row is None:
@@ -123,7 +131,7 @@ def get_run_detail(run_id: str) -> RunDetail:
     )
 
 
-@router.get("/api/runs/{run_id}/trace", response_model=TraceOut)
+@operator.get("/runs/{run_id}/trace", response_model=TraceOut)
 def get_trace(run_id: str) -> TraceOut:
     row = R.get_run(run_id)
     if row is None:
@@ -131,13 +139,17 @@ def get_trace(run_id: str) -> TraceOut:
     return TraceOut(run_id=run_id, corpus=row.get("corpus"), trace=row.get("trace"))
 
 
-@router.post("/api/runs/{run_id}/cancel", response_model=CancelOut)
+@operator.post("/runs/{run_id}/cancel", response_model=CancelOut)
 def cancel_run(run_id: str) -> CancelOut:
     if not R.set_cancel(run_id):
         raise HTTPException(status_code=404, detail="run not found")
     return CancelOut(id=run_id, cancel=True)
 
 
+# Deliberately PUBLIC and ungated: container and load-balancer health
+# checks run before any credential is available. It reports liveness,
+# the server version and run-state counts - no findings, no source, no
+# secrets.
 @router.get("/healthz")
 def healthz() -> dict:
     return health()
