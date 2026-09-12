@@ -32,6 +32,7 @@ WITH picked AS (
      WHERE (state IN ('queued', 'post_pending')
             OR (state = 'running' AND leased_until < now()))  -- dead lease
        AND (not_before IS NULL OR not_before <= now())         -- backoff gate
+       AND attempts < %(max_attempts)s                         -- attempt ceiling
      ORDER BY created_at
      FOR UPDATE SKIP LOCKED
      LIMIT 1
@@ -119,12 +120,30 @@ def coalesce_pr(owner: str, repo: str, pr_number: int, head_sha: str | None) -> 
     return {"superseded": len(superseded), "cancelled": len(cancelled)}
 
 
-def claim(*, lease_s: int, worker_id: str) -> dict | None:
+def claim(*, lease_s: int, worker_id: str, max_attempts: int) -> dict | None:
+    """Take the oldest eligible run, or None.
+
+    `attempts` increments HERE, so the row handed back already counts the
+    execution about to happen: a fresh row is 0, the first claim returns 1. With
+    `max_attempts=3` the predicate `attempts < 3` admits 0, 1 and 2 - three
+    executions - and the worker's own `attempts < max_attempts` guard
+    dead-letters on the third. The two agree by construction.
+
+    The ceiling is enforced in SQL and not only in the worker because the
+    worker's guard lives in an `except` block. A SIGKILL, an OOM kill or a
+    container eviction never reaches it: the row stays `running`, its lease
+    expires, and before this predicate existed it was claimable again forever -
+    an unbounded spend loop on one poison row.
+    """
     try:
         with pool().connection() as conn:
             return conn.execute(
                 CLAIM_SQL,
-                {"lease": timedelta(seconds=lease_s), "worker_id": worker_id},
+                {
+                    "lease": timedelta(seconds=lease_s),
+                    "worker_id": worker_id,
+                    "max_attempts": max_attempts,
+                },
             ).fetchone()
     except psycopg.OperationalError as e:
         # A dropped connection - idle pooler close, network blip, DB restart -
@@ -132,6 +151,46 @@ def claim(*, lease_s: int, worker_id: str) -> dict | None:
         # and retries instead of crashing the process (which permanently
         # removes a worker, since nothing here restarts it).
         raise TransientError(f"claim: database connection lost: {e}") from None
+
+
+REAP_SQL = """
+UPDATE runs
+   SET state        = 'failed',
+       error        = %(error)s,
+       leased_until = NULL,
+       worker_id    = NULL,
+       finished_at  = now()
+ WHERE state = 'running'
+   AND leased_until IS NOT NULL
+   AND leased_until < now()
+   AND attempts >= %(max_attempts)s
+RETURNING id
+"""
+
+ATTEMPTS_EXHAUSTED = "attempts exhausted"
+
+
+def reap_exhausted(*, max_attempts: int) -> list[str]:
+    """Dead-letter rows a crashed worker left behind at the attempt ceiling.
+
+    The claim predicate stops such a row being picked up again, which alone
+    would leave it `running` forever - invisible to the queue but never
+    resolved, and reported as in-flight by any operator view. This closes it
+    out explicitly.
+
+    One statement, so the transition is atomic. Two workers may both try; the
+    first wins and the second's WHERE no longer matches. There is no external
+    side effect to duplicate, so the race is harmless by construction.
+
+    Only expired leases are touched: a row whose worker is alive and
+    heartbeating has `leased_until` in the future and is left alone.
+    """
+    with pool().connection() as conn:
+        rows = conn.execute(
+            REAP_SQL,
+            {"error": ATTEMPTS_EXHAUSTED, "max_attempts": max_attempts},
+        ).fetchall()
+    return [r["id"] for r in rows]
 
 
 def heartbeat(run_id: str, *, lease_s: int) -> None:

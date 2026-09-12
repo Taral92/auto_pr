@@ -170,7 +170,18 @@ def main() -> None:
     try:
         while not _stop.is_set():
             try:
-                row = R.claim(lease_s=s.lease_s, worker_id=WORKER_ID)
+                # Close out anything a crashed worker abandoned at the ceiling.
+                # The claim predicate already refuses to pick those rows up, so
+                # without this they would sit `running` forever: never retried,
+                # never resolved, and reported as in-flight by every operator
+                # view. Cheap - one indexed UPDATE that normally matches nothing.
+                for reaped in R.reap_exhausted(max_attempts=s.max_attempts):
+                    print(f"[{WORKER_ID}] {reaped} reaped: attempts exhausted")
+                row = R.claim(
+                    lease_s=s.lease_s,
+                    worker_id=WORKER_ID,
+                    max_attempts=s.max_attempts,
+                )
             except TransientError as e:
                 # A DB blip must not kill the worker. Back off and retry the
                 # claim; the pool reconnects on the next attempt.

@@ -22,6 +22,7 @@ from storage.db import close_pool, init_db, pool
 
 LEASE = 900
 WORKER = "test-worker"
+MAX_ATTEMPTS = 3
 
 
 @pytest.fixture
@@ -75,7 +76,7 @@ def _claim_ids(limit=6):
     run without being confused by other rows in a shared database."""
     seen = []
     for _ in range(limit):
-        row = R.claim(lease_s=LEASE, worker_id=WORKER)
+        row = R.claim(lease_s=LEASE, worker_id=WORKER, max_attempts=MAX_ATTEMPTS)
         if row is None:
             break
         seen.append(row)
@@ -307,3 +308,157 @@ def test_the_claim_index_still_matches_the_claim_predicate(db):
             "SELECT indexdef FROM pg_indexes WHERE indexname='idx_runs_claim'"
         ).fetchone()
     assert ddl is not None
+
+
+# -- the attempt ceiling, enforced in SQL --------------------------------
+#
+# `attempts` increments in CLAIM_SQL, so the row a worker holds already counts
+# the execution it is about to perform: fresh = 0, first claim returns 1. With
+# max_attempts=3 the predicate `attempts < 3` admits 0, 1 and 2 - three
+# executions - and the worker's own `attempts < max_attempts` guard
+# dead-letters on the third. The two agree by construction.
+#
+# The ceiling has to live in SQL as well as the worker because the worker's
+# guard is inside an `except` block. A SIGKILL, an OOM kill or a container
+# eviction never reaches it: the row stays `running`, the lease expires, and
+# before this it was claimable again forever - unbounded spend on one bad row.
+
+
+def _claim():
+    return R.claim(lease_s=LEASE, worker_id=WORKER, max_attempts=MAX_ATTEMPTS)
+
+
+@pytest.mark.parametrize("attempts", [0, 1, 2])
+def test_a_run_below_the_ceiling_is_claimable(run, attempts):
+    run_id, _ = run
+    _set(run_id, attempts=attempts)
+    assert run_id in [r["id"] for r in _claim_ids()]
+
+
+@pytest.mark.parametrize("attempts", [3, 4, 99])
+def test_a_run_at_or_over_the_ceiling_is_not_claimable(run, attempts):
+    run_id, _ = run
+    _set(run_id, attempts=attempts)
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+def test_the_claim_increments_attempts(run):
+    run_id, _ = run
+    assert _row(run_id)["attempts"] == 0
+    claimed = {r["id"]: r for r in _claim_ids()}
+    assert claimed[run_id]["attempts"] == 1
+    assert _row(run_id)["attempts"] == 1
+
+
+def test_three_executions_are_permitted_then_no_more(run):
+    """What max_attempts=3 actually buys, end to end."""
+    run_id, _ = run
+    for expected in (1, 2, 3):
+        claimed = {r["id"]: r for r in _claim_ids()}
+        assert claimed[run_id]["attempts"] == expected
+        R.requeue(run_id, error="blip")         # back to queued, attempts kept
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+def test_an_expired_running_row_below_the_ceiling_is_still_reclaimed(run):
+    """Normal lease reclamation must survive the new predicate."""
+    run_id, _ = run
+    _set(run_id, state="running", attempts=1, leased_until=_in(minutes=-1))
+    claimed = {r["id"]: r for r in _claim_ids()}
+    assert claimed[run_id]["prior_state"] == "running"
+    assert claimed[run_id]["attempts"] == 2
+
+
+def test_an_expired_running_row_at_the_ceiling_is_not_reclaimed(run):
+    """The crash-loop case: before this it was claimable forever."""
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS, leased_until=_in(minutes=-1))
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+def test_not_before_still_gates_a_run_below_the_ceiling(run):
+    run_id, _ = run
+    _set(run_id, attempts=1, not_before=_in(hours=1))
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+def test_post_pending_below_the_ceiling_is_still_claimable(run):
+    """C2's retry path must not be closed by the ceiling."""
+    run_id, _ = run
+    _persisted(run_id)
+    _set(run_id, attempts=1)
+    claimed = {r["id"]: r for r in _claim_ids()}
+    assert claimed[run_id]["prior_state"] == "post_pending"
+    assert claimed[run_id]["payload"] == PAYLOAD
+
+
+def test_post_pending_at_the_ceiling_is_not_claimable(run):
+    run_id, _ = run
+    _persisted(run_id)
+    _set(run_id, attempts=MAX_ATTEMPTS)
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+# -- the reaper ----------------------------------------------------------
+
+
+def test_an_abandoned_run_at_the_ceiling_is_reaped_to_failed(run):
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS,
+         leased_until=_in(minutes=-1), worker_id="dead-worker")
+
+    assert run_id in R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+
+    row = _row(run_id)
+    assert row["state"] == "failed"
+    assert row["error"] == R.ATTEMPTS_EXHAUSTED == "attempts exhausted"
+    assert row["finished_at"] is not None
+    assert row["leased_until"] is None and row["worker_id"] is None
+
+
+def test_a_reaped_run_cannot_be_claimed_again(run):
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS, leased_until=_in(minutes=-1))
+    R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    assert run_id not in [r["id"] for r in _claim_ids()]
+
+
+def test_the_reaper_leaves_a_live_lease_alone(run):
+    """A worker that is alive and heartbeating must not be shot."""
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS, leased_until=_in(minutes=5))
+    assert run_id not in R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    assert _row(run_id)["state"] == "running"
+
+
+def test_the_reaper_leaves_a_run_below_the_ceiling_alone(run):
+    """That row is still retryable; reaping it would lose a real review."""
+    run_id, _ = run
+    _set(run_id, state="running", attempts=1, leased_until=_in(minutes=-1))
+    assert run_id not in R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    assert _row(run_id)["state"] == "running"
+
+
+def test_the_reaper_ignores_queued_and_finished_rows(run):
+    run_id, _ = run
+    _set(run_id, attempts=MAX_ATTEMPTS)            # queued, no lease
+    assert run_id not in R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    assert _row(run_id)["state"] == "queued"
+
+
+def test_the_reaper_is_idempotent(run):
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS, leased_until=_in(minutes=-1))
+    first = R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    second = R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    assert run_id in first and run_id not in second
+
+
+def test_the_reaper_does_not_resurrect_or_retry(run):
+    """It dead-letters; it must never put the row back in the queue."""
+    run_id, _ = run
+    _set(run_id, state="running", attempts=MAX_ATTEMPTS, leased_until=_in(minutes=-1))
+    R.reap_exhausted(max_attempts=MAX_ATTEMPTS)
+    row = _row(run_id)
+    assert row["state"] == "failed"
+    assert row["not_before"] is None

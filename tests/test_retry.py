@@ -499,3 +499,98 @@ def test_a_retried_post_posts_when_the_marker_is_absent(monkeypatch):
     monkeypatch.setattr(AR, "post_review", lambda *a: posts.append(a))
     assert AR.post_payload("o", "r", 1, TOKEN, {"body": "b"}, "a" * 40) is True
     assert len(posts) == 1
+
+
+# -- the poll loop actually calls the reaper ------------------------------
+#
+# The SQL is verified against real Postgres in test_retry_storage.py. What that
+# cannot show is that `worker.main()` ever runs it: a reaper nobody calls is the
+# same as no reaper, and the crash-loop row stays `running` forever.
+
+
+def test_the_poll_loop_reaps_before_claiming(monkeypatch):
+    import worker.main as W
+
+    order: list[str] = []
+
+    class Store:
+        def reap_exhausted(self, *, max_attempts):
+            order.append(f"reap({max_attempts})")
+            return ["dead-run-1"]
+
+        def claim(self, *, lease_s, worker_id, max_attempts):
+            order.append(f"claim({max_attempts})")
+            W._stop.set()               # one pass, then drain
+            return None
+
+    monkeypatch.setattr(W, "R", Store())
+    monkeypatch.setattr(W, "init_db", lambda: None)
+    monkeypatch.setattr(W, "close_pool", lambda: None)
+    monkeypatch.setattr(W._stop, "wait", lambda *_: True)
+    W._stop.clear()
+    try:
+        W.main()
+    finally:
+        W._stop.clear()
+
+    assert order == ["reap(3)", "claim(3)"], order
+
+
+def test_the_poll_loop_passes_max_attempts_from_settings(monkeypatch):
+    import worker.main as W
+    from config import get_settings
+
+    seen: dict = {}
+
+    class Store:
+        def reap_exhausted(self, *, max_attempts):
+            seen["reap"] = max_attempts
+            return []
+
+        def claim(self, *, lease_s, worker_id, max_attempts):
+            seen["claim"] = max_attempts
+            W._stop.set()
+            return None
+
+    monkeypatch.setattr(W, "R", Store())
+    monkeypatch.setattr(W, "init_db", lambda: None)
+    monkeypatch.setattr(W, "close_pool", lambda: None)
+    monkeypatch.setattr(W._stop, "wait", lambda *_: True)
+    W._stop.clear()
+    try:
+        W.main()
+    finally:
+        W._stop.clear()
+
+    assert seen["reap"] == seen["claim"] == get_settings().max_attempts
+
+
+def test_a_db_blip_in_the_reaper_does_not_kill_the_worker(monkeypatch):
+    """The reaper shares the claim's try/except; a blip must back off, not exit."""
+    import worker.main as W
+
+    calls = {"n": 0}
+
+    class Store:
+        def reap_exhausted(self, *, max_attempts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TransientError("database connection lost")
+            W._stop.set()
+            return []
+
+        def claim(self, **kw):
+            W._stop.set()
+            return None
+
+    monkeypatch.setattr(W, "R", Store())
+    monkeypatch.setattr(W, "init_db", lambda: None)
+    monkeypatch.setattr(W, "close_pool", lambda: None)
+    monkeypatch.setattr(W._stop, "wait", lambda *_: True)
+    W._stop.clear()
+    try:
+        W.main()            # must return normally, not raise
+    finally:
+        W._stop.clear()
+
+    assert calls["n"] >= 2   # it came back for a second pass
