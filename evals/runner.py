@@ -37,9 +37,57 @@ def load_cases(only: str | None) -> list[dict]:
         # lets "a degraded run is not a pass" hold without making a fixture
         # whose whole point is degrading permanently red.
         c["expect_state"] = c.get("expect_state") or "published"
+        # Quality floors, seeded from the measured baseline of each fixture.
+        # Defaults are permissive: a fixture without thresholds keeps behaving
+        # exactly as before, so adding this gate cannot fail anything on its own.
+        for field, default in THRESHOLDS.items():
+            c[field] = c.get(field, default)
         if only is None and c.get("enabled") is False:
             continue          # explicit --case still runs a disabled case
         out.append(c)
+    return out
+
+
+#: Threshold field -> permissive default. `max_fp` defaults to None meaning
+#: "unbounded", so only a fixture that declares a ceiling gets one.
+THRESHOLDS = {
+    "min_precision": 0.0,
+    "min_recall": 0.0,
+    "min_groundedness": 0.0,
+    "max_fp": None,
+}
+
+
+def threshold_failures(row: dict) -> list[str]:
+    """Every way this row falls short, as strings naming actual vs required.
+
+    The gate used to compare final state and nothing else, which let review
+    QUALITY regress silently: wide-refactor could publish four findings for two
+    expected ones, and a regression that missed sandbox-escape entirely would
+    still have `published` as its state and still exited 0.
+
+    These reuse the metrics `run_case` already computed from `evals/scoring.py`.
+    There is deliberately no second scoring path - a gate that measures
+    differently from the report it gates is worse than no gate.
+    """
+    out: list[str] = []
+    if row["state"] != row["expect_state"]:
+        reason = row.get("error") or row.get("detail") or row["state"]
+        out.append(
+            f"state {row['state']} != expected {row['expect_state']} "
+            f"(after {row['iterations']} iterations: {reason})"
+        )
+    for metric, field in (
+        ("precision", "min_precision"),
+        ("recall", "min_recall"),
+        ("groundedness", "min_groundedness"),
+    ):
+        floor = row.get(field)
+        if floor is not None and row[metric] < floor:
+            out.append(f"{metric} {row[metric]} < required {floor}")
+    ceiling = row.get("max_fp")
+    if ceiling is not None and row["fp"] > ceiling:
+        out.append(f"false positives {row['fp']} > allowed {ceiling}")
     return out
 
 
@@ -117,6 +165,7 @@ def run_case(case: dict, *, live: bool, record: bool) -> dict:
         # to the scores is what stops a breach from reading as a clean pass.
         "state": (getattr(result, "status", None) if result else None) or "crashed",
         "expect_state": case["expect_state"],
+        **{field: case.get(field) for field in THRESHOLDS},
         # Which budget went. `error` here is the graph's, not the harness's -
         # `budget_breach:tokens` says far more than `degraded` does.
         "detail": (getattr(result, "error", None) if result else None),
@@ -200,13 +249,13 @@ def main() -> None:
     # A degraded run published what it happened to have when the budget blew.
     # Scoring it as a pass is how iteration exhaustion stayed invisible for as
     # long as it did, so it exits non-zero and says which budget went.
-    bad = [r for r in all_rows if r["state"] != r["expect_state"]]
+    bad = [(r, threshold_failures(r)) for r in all_rows]
+    bad = [(r, why) for r, why in bad if why]
     if bad:
         print()
-        for r in bad:
-            reason = r["error"] or r["detail"] or r["state"]
-            print(f"NOT A PASS  {r['case']:<16} want {r['expect_state']}, "
-                  f"got {r['state']} after {r['iterations']} iterations  {reason}")
+        for r, why in bad:
+            for reason in why:
+                print(f"NOT A PASS  {r['case']:<16} {reason}")
         print()
         raise SystemExit(1)
     print()

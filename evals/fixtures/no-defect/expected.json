@@ -1,5 +1,9 @@
 {
   "id": "no-defect",
   "description": "Negative control derived from a real false positive. On PR #3 the agent reported an index out-of-bounds in PostImage.locate as a blocker, twice. The concern was real but the severity was not: post_images() builds lines from splitlines(), so the index cannot go out of range through any real path. The bounds guard is now present in this fixture, so the code is correct and ANY published finding here is a false positive.",
-  "expected": []
+  "expected": [],
+  "min_precision": 0.0,
+  "min_recall": 0.0,
+  "min_groundedness": 0.0,
+  "max_fp": 0
 }

@@ -21,5 +21,9 @@
       ]
     }
   ],
-  "expect_state": "published"
+  "expect_state": "published",
+  "min_precision": 0.5,
+  "min_recall": 1.0,
+  "min_groundedness": 1.0,
+  "max_fp": 2
 }

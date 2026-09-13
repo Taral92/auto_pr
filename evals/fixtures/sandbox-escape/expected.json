@@ -16,5 +16,9 @@
       "severity": "blocker",
       "must_contain": ["os.system"]
     }
-  ]
+  ],
+  "min_precision": 1.0,
+  "min_recall": 1.0,
+  "min_groundedness": 1.0,
+  "max_fp": 0
 }
