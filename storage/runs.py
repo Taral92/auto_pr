@@ -7,6 +7,33 @@ The claim query is the whole concurrency story:
 `SKIP LOCKED` is why this scales past one worker. Without it, N workers all
 block on the same oldest row and you have a serial queue wearing a pool's
 clothes. With it, each worker takes the oldest row nobody else holds.
+
+Ownership fencing
+-----------------
+`claim` writes `worker_id`, and that column is the lease. Every mutation a
+worker performs WHILE it holds a lease carries its own id into the WHERE
+clause and returns whether the row matched:
+
+    WHERE id = %(run_id)s AND worker_id = %(worker_id)s
+
+Without it, a worker whose lease expired could still finish. The sequence is
+real: worker A stalls long enough for its lease to lapse - a starved heartbeat
+thread, a paused container - B claims the row and starts reviewing, then A wakes
+up and calls `record_result` and `mark_posted`. A overwrites B's row and posts a
+second review. The fence makes A's UPDATE match zero rows, and `False` comes
+back so the caller can stop instead of carrying on believing it succeeded.
+
+Ownership is `worker_id`, not `leased_until > now()`. A lapsed lease that
+nobody else has claimed is not a transfer: the original owner is still the best
+candidate to finish, and failing its writes there would turn a slow run into a
+stuck row. Ownership changes when another worker CLAIMS, and that is exactly
+when `worker_id` changes.
+
+Four mutations are deliberately NOT fenced, because they exist to act on rows
+this worker does not own: `insert_queued`, `coalesce_pr` (the webhook cancelling
+someone else's in-flight run), `reap_exhausted` (closing out rows whose worker
+is gone) and `set_cancel` (the operator API). `claim` itself establishes
+ownership and carries its own predicate.
 """
 
 from __future__ import annotations
@@ -95,6 +122,11 @@ def coalesce_pr(owner: str, repo: str, pr_number: int, head_sha: str | None) -> 
     A branch pushed five times in two minutes must produce one review. Without
     this, cost scales with pushes rather than with pull requests, and the
     author gets five stale comment threads.
+
+    Deliberately UNFENCED. This runs in the API process on a push, and the
+    whole job is to act on rows other workers own - cancelling an in-flight
+    review is the point. It sets the `cancel` flag rather than a state, so the
+    owning worker still decides how its own run ends.
     """
     with pool().connection() as conn:
         superseded = conn.execute(
@@ -193,18 +225,36 @@ def reap_exhausted(*, max_attempts: int) -> list[str]:
     return [r["id"] for r in rows]
 
 
-def heartbeat(run_id: str, *, lease_s: int) -> None:
-    """Extend the lease of a run still doing work.
+def _fenced(sql: str, params: dict) -> bool:
+    """Run an ownership-fenced UPDATE. True if it matched the row.
+
+    Every fenced statement ends in `RETURNING id`, so "did this apply?" is
+    answered by the database rather than inferred. A caller that ignores the
+    result is a caller that carries on believing it still owns the run.
+    """
+    with pool().connection() as conn:
+        return conn.execute(sql, params).fetchone() is not None
+
+
+def heartbeat(run_id: str, *, lease_s: int, worker_id: str) -> bool:
+    """Extend the lease of a run still doing work. False if we no longer own it.
 
     Without this, any review slower than the lease gets reclaimed and reviewed
     twice. The alternative - a lease long enough for the worst case - means a
     crashed worker's job sits stuck for that same worst case.
+
+    Fenced, and this is the one that matters most: an unfenced heartbeat lets a
+    stale worker keep EXTENDING a lease that now belongs to someone else, which
+    both hides the handover from the new owner and keeps the reaper away. The
+    `False` is how the worker learns to stop.
     """
-    with pool().connection() as conn:
-        conn.execute(
-            "UPDATE runs SET leased_until = now() + %s::interval WHERE id = %s",
-            (timedelta(seconds=lease_s), run_id),
-        )
+    return _fenced(
+        """UPDATE runs SET leased_until = now() + %(lease)s::interval
+            WHERE id = %(run_id)s AND worker_id = %(worker_id)s
+        RETURNING id""",
+        {"lease": timedelta(seconds=lease_s), "run_id": run_id,
+         "worker_id": worker_id},
+    )
 
 
 def is_cancelled(run_id: str) -> bool:
@@ -214,6 +264,10 @@ def is_cancelled(run_id: str) -> bool:
 
 
 def set_cancel(run_id: str) -> bool:
+    """Deliberately UNFENCED: the operator API cancels runs it does not own.
+
+    Like `coalesce_pr`, this only raises a flag the owning worker reads.
+    """
     with pool().connection() as conn:
         row = conn.execute(
             "UPDATE runs SET cancel=TRUE WHERE id=%s RETURNING id", (run_id,)
@@ -221,15 +275,33 @@ def set_cancel(run_id: str) -> bool:
     return row is not None
 
 
-def mark(run_id: str, state: str, *, error: str | None = None) -> None:
-    with pool().connection() as conn:
-        conn.execute(
-            "UPDATE runs SET state=%s, error=%s, finished_at=now() WHERE id=%s",
-            (state, error, run_id),
-        )
+def mark(run_id: str, state: str, *, worker_id: str,
+         error: str | None = None) -> bool:
+    """Close a run out in a terminal state. False if we no longer own it.
+
+    Degrading through this path records the reason too, so `state='degraded'`
+    always carries one however it was reached. Any other state leaves an
+    existing reason alone rather than blanking it: a degraded review whose post
+    later failed outright is `failed`, and why it was degraded in the first
+    place is still worth knowing.
+    """
+    return _fenced(
+        """UPDATE runs
+              SET state=%(state)s,
+                  error=%(error)s,
+                  degraded_reason = CASE WHEN %(state)s = 'degraded'
+                                         THEN COALESCE(%(error)s, 'unknown')
+                                         ELSE degraded_reason END,
+                  finished_at=now()
+            WHERE id=%(run_id)s AND worker_id=%(worker_id)s
+        RETURNING id""",
+        {"state": state, "error": error, "run_id": run_id,
+         "worker_id": worker_id},
+    )
 
 
-def requeue(run_id: str, *, error: str, delay_s: float = 0.0) -> None:
+def requeue(run_id: str, *, error: str, worker_id: str,
+            delay_s: float = 0.0) -> bool:
     """Put a run back, optionally not before `delay_s` from now.
 
     `not_before` is the whole backoff mechanism. Without it this set state to
@@ -237,70 +309,135 @@ def requeue(run_id: str, *, error: str, delay_s: float = 0.0) -> None:
     attempts were spent in about six seconds. Against a rate limit that is a
     retry storm that asks the same question three times and gets the same
     answer.
+
+    Fenced, and it RELEASES ownership by design: after this the row is queued
+    with `worker_id` NULL, so this worker's later writes are fenced out too -
+    which is correct, because it has handed the run back.
     """
-    with pool().connection() as conn:
-        conn.execute(
-            """UPDATE runs SET state='queued', leased_until=NULL,
-                               worker_id=NULL, error=%s,
-                               not_before = now() + %s::interval
-                WHERE id=%s""",
-            (error, timedelta(seconds=max(delay_s, 0.0)), run_id),
-        )
+    return _fenced(
+        """UPDATE runs SET state='queued', leased_until=NULL,
+                           worker_id=NULL, error=%(error)s,
+                           not_before = now() + %(delay)s::interval
+            WHERE id=%(run_id)s AND worker_id=%(worker_id)s
+        RETURNING id""",
+        {"error": error, "delay": timedelta(seconds=max(delay_s, 0.0)),
+         "run_id": run_id, "worker_id": worker_id},
+    )
 
 
-def requeue_post(run_id: str, *, error: str, delay_s: float = 0.0) -> None:
+def requeue_post(run_id: str, *, error: str, worker_id: str,
+                 delay_s: float = 0.0) -> bool:
     """Retry only the GitHub post, keeping the computed review.
 
     State stays `post_pending` and the payload stays in the row, so the next
     claim re-posts instead of re-running the model. This is the difference
     between a failed post costing one API call and costing a whole review.
+
+    Fenced. A `post_pending` row IS owned while it is being posted: `claim`
+    sets state='running' and `worker_id` for it exactly as for fresh work, and
+    hands the old state back as `prior_state`. So the worker holds a lease
+    here, and a stale one must not be able to reset the retry clock.
     """
-    with pool().connection() as conn:
-        conn.execute(
-            """UPDATE runs SET state='post_pending', leased_until=NULL,
-                               worker_id=NULL, error=%s,
-                               not_before = now() + %s::interval
-                WHERE id=%s""",
-            (error, timedelta(seconds=max(delay_s, 0.0)), run_id),
-        )
+    return _fenced(
+        """UPDATE runs SET state='post_pending', leased_until=NULL,
+                           worker_id=NULL, error=%(error)s,
+                           not_before = now() + %(delay)s::interval
+            WHERE id=%(run_id)s AND worker_id=%(worker_id)s
+        RETURNING id""",
+        {"error": error, "delay": timedelta(seconds=max(delay_s, 0.0)),
+         "run_id": run_id, "worker_id": worker_id},
+    )
 
 
-def mark_posted(run_id: str, *, state: str, posted: bool) -> None:
-    """Close out a run whose post has been settled."""
+def mark_posted(run_id: str, *, state: str, posted: bool,
+                worker_id: str) -> bool:
+    """Close out a run whose post has been settled. False if we lost the lease.
+
+    The findings update is gated on the run UPDATE matching, inside one
+    transaction: a stale worker must not be able to flag another worker's
+    findings as posted, which is the row that tells an operator a comment
+    reached GitHub.
+
+    `error` is cleared here and `degraded_reason` deliberately is not. Clearing
+    is right for `error`: it holds the post failure we were retrying, and the
+    post has now settled. It was wrong for the degradation reason, which this
+    same statement used to erase - leaving `state='degraded'` with nothing
+    saying which budget went, the one field that makes the state actionable.
+    """
     with pool().connection() as conn, conn.transaction():
-        conn.execute(
-            """UPDATE runs SET state=%s, error=NULL, not_before=NULL,
-                               finished_at=now() WHERE id=%s""",
-            (state, run_id),
-        )
+        owned = conn.execute(
+            """UPDATE runs SET state=%(state)s, error=NULL, not_before=NULL,
+                               finished_at=now()
+                WHERE id=%(run_id)s AND worker_id=%(worker_id)s
+            RETURNING id""",
+            {"state": state, "run_id": run_id, "worker_id": worker_id},
+        ).fetchone()
+        if owned is None:
+            return False
         if posted:
             conn.execute(
                 "UPDATE findings SET posted=TRUE WHERE run_id=%s AND anchored<>%s",
                 (run_id, "dropped"),
             )
+    return True
 
 
-def record_result(run_id: str, result: Any, *, state: str) -> None:
+DEGRADED = "degraded"
+
+
+def degraded_reason_of(result: Any) -> str | None:
+    """The durable reason a review was cut short, or None if it was not.
+
+    Keyed on `result.status`, never on the presence of `result.error`: a run
+    that FAILED also has an error, and recording that as a degradation reason
+    would turn an outright failure into "we published something partial",
+    which is a different and much more reassuring claim than the truth.
+    """
+    if (getattr(result, "status", None) or "") != DEGRADED:
+        return None
+    return getattr(result, "error", None) or "unknown"
+
+
+def record_result(run_id: str, result: Any, *, state: str,
+                  worker_id: str) -> bool:
+    """Commit a computed review. False if another worker owns this run now.
+
+    This is the commit point of the whole pipeline, so it is the most important
+    fence: the findings are DELETEd and rewritten here, and the worker posts to
+    GitHub immediately afterwards. A stale worker reaching this would replace
+    the new owner's result with its own and then post a second review. `False`
+    tells the caller to drop the result on the floor and post nothing.
+
+    It is also where `degraded_reason` is written. `result.error` carries the
+    reason only while the result is in memory; the row it lands in is the one
+    the post path then clears and overwrites, so the reason has to be put
+    somewhere with a different lifetime, and this is the only moment it is
+    still known.
+    """
     g = result.grounding or {}
     a = result.anchoring or {}
     with pool().connection() as conn, conn.transaction():
-        conn.execute(
+        owned = conn.execute(
             """
             UPDATE runs SET state=%s, head_sha=%s, prompt_sha=%s, model=%s,
                    tokens_in=%s, tokens_out=%s, wall_clock_s=%s,
                    grounded=%s, near=%s, ungrounded=%s,
                    inline=%s, summary=%s, dropped=%s,
                    corpus=%s, trace=%s, payload=%s,
-                   error=%s, finished_at=now()
-             WHERE id=%s
+                   error=%s, degraded_reason=%s, finished_at=now()
+             WHERE id=%s AND worker_id=%s
+            RETURNING id
             """,
             (state, result.head_sha, result.prompt_sha, result.model,
              result.tokens_in, result.tokens_out, result.wall_clock_s,
              g.get("grounded"), g.get("near"), g.get("ungrounded"),
              a.get("inline"), a.get("summary"), a.get("dropped"),
              json.dumps(result.corpus), json.dumps(result.trace),
-             json.dumps(result.payload), result.error, run_id),
-        )
+             json.dumps(result.payload), result.error,
+             degraded_reason_of(result), run_id, worker_id),
+        ).fetchone()
+        if owned is None:
+            return False
         conn.execute("DELETE FROM findings WHERE run_id=%s", (run_id,))
         finding_rows = [
             (str(uuid.uuid4()), run_id, f.severity, f.category, f.path,
@@ -316,6 +453,7 @@ def record_result(run_id: str, result: Any, *, state: str) -> None:
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     finding_rows,
                 )
+    return True
 
 
 def get_run(run_id: str) -> dict | None:

@@ -175,10 +175,12 @@ def test_post_pending_still_works_after_the_checkpoint_is_deleted(sandbox,
     monkeypatch.setattr(
         W, "R",
         type("S", (), {
-            "mark_posted": lambda s, rid, *, state, posted: calls.__setitem__(
-                "marked", (state, posted)),
-            "mark": lambda s, rid, st, *, error=None: None,
-            "requeue_post": lambda s, rid, *, error, delay_s=0.0: None,
+            # **kw and a True return: these are ownership-fenced now, and the
+            # worker branches on the answer.
+            "mark_posted": lambda s, rid, *, state, posted, **kw: (
+                calls.__setitem__("marked", (state, posted)), True)[1],
+            "mark": lambda s, rid, st, *, error=None, **kw: True,
+            "requeue_post": lambda s, rid, *, error, delay_s=0.0, **kw: True,
         })(),
     )
     W.post_pending({"id": "run-ok", "owner": "o", "repo": "r", "pr_number": 1,

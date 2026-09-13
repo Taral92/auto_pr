@@ -114,7 +114,8 @@ def test_a_null_not_before_is_claimable(run):
 
 def test_requeue_with_a_delay_sets_not_before_in_the_future(run):
     run_id, _ = run
-    R.requeue(run_id, error="429", delay_s=120)
+    _set(run_id, state="running", worker_id=WORKER)   # requeue needs the lease
+    assert R.requeue(run_id, error="429", delay_s=120, worker_id=WORKER) is True
     row = _row(run_id)
     assert row["state"] == "queued"
     assert row["not_before"] is not None
@@ -122,9 +123,15 @@ def test_requeue_with_a_delay_sets_not_before_in_the_future(run):
 
 
 def test_requeue_without_a_delay_is_immediately_claimable(run):
-    """Preserves the old behaviour when no delay is asked for."""
+    """Preserves the old behaviour when no delay is asked for.
+
+    The requeue's own return value is asserted: a fenced-out requeue is a
+    no-op, and a no-op leaves the row queued and claimable - so without this
+    the test would pass whether or not the requeue ever ran.
+    """
     run_id, _ = run
-    R.requeue(run_id, error="blip")
+    _set(run_id, state="running", worker_id=WORKER)
+    assert R.requeue(run_id, error="blip", worker_id=WORKER) is True
     assert run_id in [r["id"] for r in _claim_ids()]
 
 
@@ -161,18 +168,26 @@ def test_a_dead_lease_is_still_reclaimed(run):
 PAYLOAD = {"event": "COMMENT", "body": "b <!-- auto-pr:key -->", "comments": []}
 
 
-def _persisted(run_id):
+def _persisted(run_id, worker_id=WORKER):
+    """A review computed and persisted by a worker that still holds the lease.
+
+    `worker_id` is part of that state, not decoration: every mutation below is
+    ownership-fenced, so a row with no owner is a row nobody may close out.
+    """
     with pool().connection() as conn:
         conn.execute(
-            "UPDATE runs SET state='post_pending', payload=%s, model=%s WHERE id=%s",
-            (json.dumps(PAYLOAD), "gpt-5.6-luna", run_id),
+            """UPDATE runs SET state='post_pending', payload=%s, model=%s,
+                               worker_id=%s
+                WHERE id=%s""",
+            (json.dumps(PAYLOAD), "gpt-5.6-luna", worker_id, run_id),
         )
 
 
 def test_requeue_post_keeps_state_and_payload(run):
     run_id, _ = run
     _persisted(run_id)
-    R.requeue_post(run_id, error="GitHub 429 secondary limit", delay_s=45)
+    R.requeue_post(run_id, error="GitHub 429 secondary limit", delay_s=45,
+                   worker_id=WORKER)
 
     row = _row(run_id)
     assert row["state"] == "post_pending"        # not 'queued': no re-review
@@ -185,14 +200,14 @@ def test_requeue_post_keeps_state_and_payload(run):
 def test_a_requeued_post_is_not_claimable_until_its_time(run):
     run_id, _ = run
     _persisted(run_id)
-    R.requeue_post(run_id, error="429", delay_s=3600)
+    R.requeue_post(run_id, error="429", delay_s=3600, worker_id=WORKER)
     assert run_id not in [r["id"] for r in _claim_ids()]
 
 
 def test_a_requeued_post_is_claimable_once_due_and_routes_as_post_pending(run):
     run_id, _ = run
     _persisted(run_id)
-    R.requeue_post(run_id, error="429", delay_s=0)
+    R.requeue_post(run_id, error="429", delay_s=0, worker_id=WORKER)
     claimed = {r["id"]: r for r in _claim_ids()}
     assert claimed[run_id]["prior_state"] == "post_pending"
     assert claimed[run_id]["payload"] == PAYLOAD
@@ -215,7 +230,8 @@ def _finding(run_id, anchored):
 def test_mark_posted_moves_post_pending_to_published(run):
     run_id, _ = run
     _persisted(run_id)
-    R.mark_posted(run_id, state="published", posted=True)
+    R.mark_posted(run_id, state="published", posted=True,
+                  worker_id=WORKER)
 
     row = _row(run_id)
     assert row["state"] == "published"
@@ -227,8 +243,8 @@ def test_mark_posted_moves_post_pending_to_published(run):
 def test_mark_posted_moves_running_to_degraded(run):
     """A degraded review still publishes; the state must survive the post."""
     run_id, _ = run
-    _set(run_id, state="running")
-    R.mark_posted(run_id, state="degraded", posted=True)
+    _set(run_id, state="running", worker_id=WORKER)
+    R.mark_posted(run_id, state="degraded", posted=True, worker_id=WORKER)
     assert _row(run_id)["state"] == "degraded"
 
 
@@ -238,7 +254,8 @@ def test_mark_posted_flags_only_the_findings_that_reached_github(run):
     _finding(run_id, "inline")
     _finding(run_id, "summary")
     _finding(run_id, "dropped")
-    R.mark_posted(run_id, state="published", posted=True)
+    R.mark_posted(run_id, state="published", posted=True,
+                  worker_id=WORKER)
 
     by_anchor = {f["anchored"]: f["posted"] for f in R.findings_for(run_id)}
     assert by_anchor["inline"] is True
@@ -251,14 +268,16 @@ def test_mark_posted_with_posted_false_leaves_findings_unposted(run):
     run_id, _ = run
     _persisted(run_id)
     _finding(run_id, "inline")
-    R.mark_posted(run_id, state="published", posted=False)
+    R.mark_posted(run_id, state="published", posted=False,
+                  worker_id=WORKER)
     assert all(f["posted"] is False for f in R.findings_for(run_id))
 
 
 def test_a_closed_out_run_is_no_longer_claimable(run):
     run_id, _ = run
     _persisted(run_id)
-    R.mark_posted(run_id, state="published", posted=True)
+    R.mark_posted(run_id, state="published", posted=True,
+                  worker_id=WORKER)
     assert run_id not in [r["id"] for r in _claim_ids()]
 
 
@@ -356,7 +375,7 @@ def test_three_executions_are_permitted_then_no_more(run):
     for expected in (1, 2, 3):
         claimed = {r["id"]: r for r in _claim_ids()}
         assert claimed[run_id]["attempts"] == expected
-        R.requeue(run_id, error="blip")         # back to queued, attempts kept
+        R.requeue(run_id, error="blip", worker_id=WORKER)   # queued, attempts kept
     assert run_id not in [r["id"] for r in _claim_ids()]
 
 

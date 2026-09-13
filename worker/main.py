@@ -38,6 +38,18 @@ def token_provider_for(row: dict):
     return static_provider(get_settings().github_token.get_secret_value())
 
 
+def _owned(applied: bool, run_id: str, what: str) -> bool:
+    """Report a fenced write that did not apply, and pass the verdict on.
+
+    Every fenced storage call returns whether it matched the row. Losing the
+    lease is not an error - another worker legitimately owns this run now - but
+    it must be visible, and it must never read as success.
+    """
+    if not applied:
+        print(f"[{WORKER_ID}] {run_id} {what} skipped: lease lost to another worker")
+    return applied
+
+
 def _retry_delay(row: dict, exc: TransientError) -> float:
     """Wait before the next attempt: the service's own hint, else backoff."""
     return delay_for(
@@ -53,6 +65,12 @@ def post_pending(row: dict) -> None:
     failure at post time used to discard a finished review and re-run the whole
     pipeline - paying for every turn a second and third time to answer one API
     call that had failed.
+
+    A `post_pending` row IS leased while it is being posted - `claim` sets
+    state='running' and `worker_id` for it exactly as for fresh work, and hands
+    the previous state back as `prior_state`. So every write below is fenced
+    like any other owned mutation. The duplicate-post defence at GitHub remains
+    the idempotency marker, which is what makes a lost lease here cost nothing.
     """
     from agent.review import post_payload
 
@@ -60,24 +78,47 @@ def post_pending(row: dict) -> None:
     run_id = row["id"]
     payload = row.get("payload")
     if not payload:
-        R.mark(run_id, "failed", error="post_pending with no persisted payload")
+        _owned(
+            R.mark(run_id, "failed", worker_id=WORKER_ID,
+                   error="post_pending with no persisted payload"),
+            run_id, "mark(failed)",
+        )
         return
     try:
         posted = post_payload(
             row["owner"], row["repo"], row["pr_number"],
             token_provider_for(row), payload, row.get("head_sha") or "",
         )
-        R.mark_posted(run_id, state="published", posted=posted)
-        print(f"[{WORKER_ID}] {run_id} posted={posted} (no model work)")
+        # Not hardcoded 'published': this row may be a DEGRADED review whose
+        # first post attempt failed. `record_result` put the reason in
+        # `degraded_reason`, which survives `requeue_post` - unlike `error`,
+        # which that retry overwrites with the post failure - so it is what
+        # tells us which terminal state this run is owed.
+        final = "degraded" if row.get("degraded_reason") else "published"
+        if _owned(
+            R.mark_posted(run_id, state=final, posted=posted,
+                          worker_id=WORKER_ID),
+            run_id, "mark_posted",
+        ):
+            print(f"[{WORKER_ID}] {run_id} {final} posted={posted} (no model work)")
     except TransientError as e:
         if int(row.get("attempts") or 0) < s.max_attempts:
             wait = _retry_delay(row, e)
-            R.requeue_post(run_id, error=str(e), delay_s=wait)
-            print(f"[{WORKER_ID}] {run_id} post failed, retry in {wait:.1f}s: {e}")
+            if _owned(
+                R.requeue_post(run_id, error=str(e), delay_s=wait,
+                               worker_id=WORKER_ID),
+                run_id, "requeue_post",
+            ):
+                print(f"[{WORKER_ID}] {run_id} post failed, retry in {wait:.1f}s: {e}")
         else:
-            R.mark(run_id, "failed", error=f"post retries exhausted: {e}")
+            _owned(
+                R.mark(run_id, "failed", worker_id=WORKER_ID,
+                       error=f"post retries exhausted: {e}"),
+                run_id, "mark(failed)",
+            )
     except PermanentError as e:
-        R.mark(run_id, "failed", error=str(e))
+        _owned(R.mark(run_id, "failed", worker_id=WORKER_ID, error=str(e)),
+               run_id, "mark(failed)")
 
 
 def run_one(row: dict) -> None:
@@ -87,21 +128,29 @@ def run_one(row: dict) -> None:
     s = get_settings()
     run_id = row["id"]
     tok_run = run_id_var.set(run_id)
-    # The graph checks this between nodes, so a cancel lands within one node
-    # rather than at the end of the run.
-    tok_cancel = is_cancelled.set(lambda: R.is_cancelled(run_id))
-
     # Extend the lease while the job is alive. Without it any review slower
     # than the lease gets reclaimed and reviewed twice; with a lease long
     # enough for the worst case, a crashed job sits stuck for that long.
     beat = threading.Event()
+    # Set when a heartbeat finds the lease is no longer ours. It feeds the
+    # graph's own cancel hook, so the run unwinds at the next node boundary
+    # rather than working on for minutes against a run someone else owns.
+    lease_lost = threading.Event()
 
     def heartbeat():
         while not beat.wait(s.lease_s / 3):
-            R.heartbeat(run_id, lease_s=s.lease_s)
+            if not R.heartbeat(run_id, lease_s=s.lease_s, worker_id=WORKER_ID):
+                print(f"[{WORKER_ID}] {run_id} lease lost; abandoning this run")
+                lease_lost.set()
+                return
 
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
+    # The graph checks this between nodes, so a cancel - or a lost lease -
+    # lands within one node rather than at the end of the run.
+    tok_cancel = is_cancelled.set(
+        lambda: lease_lost.is_set() or R.is_cancelled(run_id)
+    )
     try:
         # The model pipeline runs with post=False, so nothing reaches GitHub
         # until the result is in the database. `record_result` is the commit
@@ -117,12 +166,24 @@ def run_one(row: dict) -> None:
             attempt=int(row.get("attempts") or 0),
         )
         final = result.status or "published"
-        R.record_result(run_id, result, state="post_pending")
+        # The fence that matters most. If another worker has claimed this run,
+        # our result is stale: dropping it here is also what stops us posting a
+        # second review below, because the post is the next statement.
+        if not _owned(
+            R.record_result(run_id, result, state="post_pending",
+                            worker_id=WORKER_ID),
+            run_id, "record_result",
+        ):
+            return
         print(f"[{WORKER_ID}] {run_id} {final} computed and persisted "
               f"grounded={result.grounding.get('grounded')} "
               f"inline={result.anchoring.get('inline')}")
         if result.dry_run or final == "failed":
-            R.mark_posted(run_id, state=final, posted=False)
+            _owned(
+                R.mark_posted(run_id, state=final, posted=False,
+                              worker_id=WORKER_ID),
+                run_id, "mark_posted",
+            )
             return
         try:
             posted = post_payload(
@@ -130,28 +191,58 @@ def run_one(row: dict) -> None:
                 token_provider_for(row), result.payload,
                 result.head_sha,
             )
-            R.mark_posted(run_id, state=final, posted=posted)
-            print(f"[{WORKER_ID}] {run_id} posted={posted}")
+            if _owned(
+                R.mark_posted(run_id, state=final, posted=posted,
+                              worker_id=WORKER_ID),
+                run_id, "mark_posted",
+            ):
+                print(f"[{WORKER_ID}] {run_id} posted={posted}")
         except TransientError as e:
             wait = _retry_delay(row, e)
-            R.requeue_post(run_id, error=str(e), delay_s=wait)
-            print(f"[{WORKER_ID}] {run_id} review kept, post retry in "
-                  f"{wait:.1f}s: {e}")
+            if _owned(
+                R.requeue_post(run_id, error=str(e), delay_s=wait,
+                               worker_id=WORKER_ID),
+                run_id, "requeue_post",
+            ):
+                print(f"[{WORKER_ID}] {run_id} review kept, post retry in "
+                      f"{wait:.1f}s: {e}")
     except Cancelled:
-        R.mark(run_id, "cancelled")
+        # A lost lease unwinds through the same cancel hook, but it is not a
+        # cancellation: the run belongs to someone else now, and writing any
+        # terminal state would trample it. The fence would refuse us anyway;
+        # this just keeps the log honest about which of the two happened.
+        if lease_lost.is_set():
+            print(f"[{WORKER_ID}] {run_id} released to its new owner")
+        else:
+            _owned(R.mark(run_id, "cancelled", worker_id=WORKER_ID),
+                   run_id, "mark(cancelled)")
     except BudgetExceeded as e:
-        R.mark(run_id, "degraded", error=str(e))
+        _owned(R.mark(run_id, "degraded", worker_id=WORKER_ID, error=str(e)),
+               run_id, "mark(degraded)")
     except TransientError as e:
         if int(row.get("attempts") or 0) < s.max_attempts:
             wait = _retry_delay(row, e)
-            R.requeue(run_id, error=str(e), delay_s=wait)
-            print(f"[{WORKER_ID}] {run_id} transient, retry in {wait:.1f}s: {e}")
+            if _owned(
+                R.requeue(run_id, error=str(e), delay_s=wait,
+                          worker_id=WORKER_ID),
+                run_id, "requeue",
+            ):
+                print(f"[{WORKER_ID}] {run_id} transient, retry in {wait:.1f}s: {e}")
         else:
-            R.mark(run_id, "failed", error=f"retries exhausted: {e}")
+            _owned(
+                R.mark(run_id, "failed", worker_id=WORKER_ID,
+                       error=f"retries exhausted: {e}"),
+                run_id, "mark(failed)",
+            )
     except PermanentError as e:
-        R.mark(run_id, "failed", error=str(e))
+        _owned(R.mark(run_id, "failed", worker_id=WORKER_ID, error=str(e)),
+               run_id, "mark(failed)")
     except Exception as e:                      # a bug, not a blip - be loud
-        R.mark(run_id, "failed", error=f"{type(e).__name__}: {e}")
+        _owned(
+            R.mark(run_id, "failed", worker_id=WORKER_ID,
+                   error=f"{type(e).__name__}: {e}"),
+            run_id, "mark(failed)",
+        )
         print(f"[{WORKER_ID}] {run_id} UNEXPECTED {type(e).__name__}: {e}")
     finally:
         beat.set()

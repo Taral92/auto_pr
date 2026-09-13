@@ -149,24 +149,32 @@ class FakeStore:
         self.calls: list[tuple] = []
         self.rows: dict = {}
 
-    def record_result(self, run_id, result, *, state):
+    # Every fenced call returns whether it owned the row. These say True -
+    # the single-worker happy path - and **kwargs keeps them from breaking on
+    # the next additive signature change rather than on what is being tested.
+    def record_result(self, run_id, result, *, state, **kw):
         self.calls.append(("record_result", state))
         self.rows[run_id] = {"payload": result.payload, "state": state}
+        return True
 
-    def mark_posted(self, run_id, *, state, posted):
+    def mark_posted(self, run_id, *, state, posted, **kw):
         self.calls.append(("mark_posted", state, posted))
+        return True
 
-    def requeue_post(self, run_id, *, error, delay_s=0.0):
+    def requeue_post(self, run_id, *, error, delay_s=0.0, **kw):
         self.calls.append(("requeue_post", round(delay_s, 3)))
+        return True
 
-    def requeue(self, run_id, *, error, delay_s=0.0):
+    def requeue(self, run_id, *, error, delay_s=0.0, **kw):
         self.calls.append(("requeue", round(delay_s, 3)))
+        return True
 
-    def mark(self, run_id, state, *, error=None):
+    def mark(self, run_id, state, *, error=None, **kw):
         self.calls.append(("mark", state, error))
+        return True
 
     def heartbeat(self, *a, **k):
-        pass
+        return True
 
     def is_cancelled(self, *a, **k):
         return False
