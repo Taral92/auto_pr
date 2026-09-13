@@ -9,11 +9,13 @@ No database and no network: the gate rejects before any handler runs, and the
 two authorised cases stub the storage layer.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import config
@@ -207,6 +209,27 @@ def test_webhook_still_rejects_a_bad_signature(monkeypatch):
                  "X-GitHub-Event": "pull_request"},
     )
     assert r.status_code == 401
+
+
+def test_webhook_rejects_a_too_large_content_length_before_buffering(monkeypatch):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET)
+    r = _client(monkeypatch, SECRET).post(
+        "/webhook", content=b"",
+        headers={"Content-Length": str(routes.MAX_WEBHOOK_BYTES + 1)},
+    )
+    assert r.status_code == 413
+
+
+def test_webhook_does_not_buffer_a_too_large_content_length():
+    class OversizedRequest:
+        headers = {"content-length": str(routes.MAX_WEBHOOK_BYTES + 1)}
+
+        async def body(self):
+            pytest.fail("oversized webhook body was buffered")
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(routes.webhook(OversizedRequest()))
+    assert excinfo.value.status_code == 413
 
 
 def test_operator_secret_does_not_authenticate_the_webhook(monkeypatch):

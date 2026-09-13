@@ -194,6 +194,25 @@ def test_the_auth_header_is_scoped_to_one_host():
     assert key == "http.https://github.com/.extraHeader"
 
 
+def test_git_timeout_is_transient_and_fetch_is_bounded(tmp_path, monkeypatch):
+    dest = tmp_path / "timeout"
+    dest.mkdir()
+    calls = []
+
+    def timed_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if "fetch" in cmd:
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, stdout="")
+
+    monkeypatch.setattr(C.subprocess, "run", timed_run)
+    with pytest.raises(TransientError, match="git fetch timed out"):
+        C.clone_head(str(dest), "o", "r", 7, TOKEN, "0" * 40)
+
+    fetch = next(kwargs for cmd, kwargs in calls if "fetch" in cmd)
+    assert fetch["timeout"] == 120
+
+
 # -- the token is not in logs or errors -----------------------------------
 
 

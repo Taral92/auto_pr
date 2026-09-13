@@ -441,7 +441,9 @@ class ModelClient:
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
-        client = Anthropic(api_key=s.anthropic_api_key.get_secret_value())
+        client = Anthropic(
+            api_key=s.anthropic_api_key.get_secret_value(), timeout=120
+        )
         try:
             return client.messages.create(**kwargs)
         except APIConnectionError as e:
@@ -478,7 +480,12 @@ class ModelClient:
         if tool_choice is not None:
             kwargs["tool_choice"] = {"type": "function", "name": tool_choice["name"]}
 
-        client = OpenAI(api_key=s.openai_api_key.get_secret_value())
+        # The retry loop below owns retry policy.  SDK retries would multiply
+        # attempts and make a transient outage exceed the configured budget.
+        client = OpenAI(
+            api_key=s.openai_api_key.get_secret_value(), timeout=120,
+            max_retries=0,
+        )
         attempt = 0
         while True:
             attempt += 1

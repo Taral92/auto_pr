@@ -54,9 +54,13 @@ def clone_head(
         cmd = ["git", "-C", dest, *helper_off, *args]
         try:
             proc = subprocess.run(
-                cmd, check=True, capture_output=True, text=True, env=env
+                cmd, check=True, capture_output=True, text=True, env=env, timeout=120
             )
             return proc.stdout
+        except subprocess.TimeoutExpired:
+            raise TransientError(
+                f"git {args[0]} timed out after 120 seconds"
+            ) from None
         except subprocess.CalledProcessError as e:
             msg = redact((e.stderr or e.stdout or "").strip(), token)
             lower = msg.lower()

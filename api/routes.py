@@ -20,6 +20,7 @@ from .schemas import (
 )
 
 router = APIRouter()
+MAX_WEBHOOK_BYTES = 25 * 1024 * 1024
 
 # Everything under /api is operator-only. The dependency sits on the ROUTER, not
 # on each route, so a route added here later is protected by default instead of
@@ -39,6 +40,14 @@ async def webhook(request: Request) -> Response:
     GitHub retries anything slower than ~10s and an agent run takes minutes,
     so the only work here is a signature check and one INSERT.
     """
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_WEBHOOK_BYTES:
+                raise HTTPException(status_code=413, detail="webhook payload too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from None
+
     s = get_settings()
     body = await request.body()
     if not verify(body, request.headers.get(HEADER),
