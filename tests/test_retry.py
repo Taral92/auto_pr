@@ -343,11 +343,16 @@ def _patch_review(monkeypatch, *, post_effect=None, on_review=None):
     """Fake agent.review so no model and no GitHub call happens."""
     import agent.review as AR
 
-    seen = {"reviews": 0, "posts": 0, "post_kwarg": None}
+    seen = {"reviews": 0, "posts": 0, "post_kwarg": None, "kwargs": {}}
 
-    def fake_review_pr(owner, repo, number, token, dry_run=False, post=True):
+    # **kwargs, not a fixed signature: this double exists to record what the
+    # worker passes, and a literal copy of review_pr's parameters means every
+    # additive change to it fails here as a TypeError rather than as whatever
+    # the test is actually about.
+    def fake_review_pr(owner, repo, number, token, **kwargs):
         seen["reviews"] += 1
-        seen["post_kwarg"] = post
+        seen["post_kwarg"] = kwargs.get("post", True)
+        seen["kwargs"] = kwargs
         if on_review:
             on_review()
         return FakeResult()
@@ -372,6 +377,16 @@ def test_the_review_is_persisted_before_the_post(worker, monkeypatch):
     assert kinds.index("record_result") < kinds.index("mark_posted")
     assert ("record_result", "post_pending") in store.calls
     assert seen["post_kwarg"] is False      # the pipeline does not post
+
+
+def test_the_worker_passes_the_attempt_it_is_executing(worker, monkeypatch):
+    """Only names the trace file, but a wrong value means two attempts of one
+    run overwrite each other when traces are on."""
+    W, store = worker
+    seen = _patch_review(monkeypatch)
+    W.run_one({**ROW, "attempts": 2})
+
+    assert seen["kwargs"]["attempt"] == 2
 
 
 def test_a_post_failure_keeps_the_review_and_retries_only_the_post(worker, monkeypatch):

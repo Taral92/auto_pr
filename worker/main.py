@@ -111,6 +111,10 @@ def run_one(row: dict) -> None:
             token_provider_for(row),
             dry_run=bool(row.get("dry_run")),
             post=False,
+            # Only names the trace file, and only when traces are switched on.
+            # `claim` has already incremented attempts, so this is the attempt
+            # being executed - two attempts of one run cannot collide.
+            attempt=int(row.get("attempts") or 0),
         )
         final = result.status or "published"
         R.record_result(run_id, result, state="post_pending")
@@ -166,6 +170,16 @@ def main() -> None:
             f"reviewed twice."
         )
     init_db()
+    # Boot sweep. Every checkpoint thread in the local DB is orphaned: nothing
+    # resumes a thread, so a thread outlives its own invoke only when a crash
+    # stopped `review_pr` from deleting it. Once here, not again - this is not
+    # a reaper, and it never runs against a live thread, because this process
+    # is the only writer of that file and has not started reviewing yet.
+    from agent.review import sweep_checkpoints
+
+    swept = sweep_checkpoints()
+    if swept:
+        print(f"[{WORKER_ID}] boot sweep: dropped {swept} orphaned checkpoint thread(s)")
     print(f"[{WORKER_ID}] up; lease={s.lease_s}s")
     try:
         while not _stop.is_set():

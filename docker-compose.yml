@@ -33,6 +33,13 @@ services:
     # The whole point of Postgres + SKIP LOCKED: this number can go up.
     deploy:
       replicas: 1
+    # Deliberately NO volume for /app/runs. The LangGraph checkpoint DB there
+    # is container-local scratch: the worker deletes each thread when its
+    # review returns and sweeps the rest at boot, so it stays small and nothing
+    # in it is worth keeping. Mounting it - especially shared between replicas -
+    # would turn that into a permanent store and put concurrent writers on one
+    # SQLite file (WAL, busy_timeout 5s), where a slow write surfaces as
+    # "database is locked" and fails a review. Durable state is Postgres.
 
 volumes:
   pgdata:

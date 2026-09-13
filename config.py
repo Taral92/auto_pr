@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     model_mode: str = "live"          # live | record | replay
     cassette: str = ""                # cassette name under evals/cassettes/
 
+    # Trace JSON under runs/. OFF by default: `record_result` already stores
+    # the same trace, corpus and payload on the runs row, and the operator API
+    # serves them from there - so on the worker these files are a second,
+    # unmanaged copy of private source that nothing reads. The CLI turns them
+    # on explicitly, because there it is the only output there is.
+    write_trace: bool = False
+    # Newest trace files kept when they ARE enabled. Bounded because the
+    # directory has no rotation of its own and lives on the container's
+    # writable layer, not a volume.
+    max_trace_files: int = 200
+
     # Context budget. Caps cumulative tool output fed back into the loop,
     # independent of any single tool's own truncation.
     max_tool_bytes_total: int = 120_000

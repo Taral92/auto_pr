@@ -32,7 +32,10 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as e:
         raise SystemExit(str(e)) from None
 
-    result = review_pr(owner, repo, number, token, dry_run=args.dry_run)
+    # write_trace=True: on the CLI the runs/ file is the only record there
+    # is. The worker leaves it to the setting (off) because Postgres has it.
+    result = review_pr(owner, repo, number, token, dry_run=args.dry_run,
+                       write_trace=True)
     print(json.dumps(result.payload, indent=2))
     print(
         f"grounding={result.grounding} anchoring={result.anchoring} "
