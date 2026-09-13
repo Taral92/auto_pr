@@ -20,7 +20,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from core.models import PublishedFinding, ReviewResult
 from gh import build_review
 from .graph import RECURSION_LIMIT, build_graph
-from .graph_state import ReviewState
+from .graph_state import ReviewState, fresh_state
 from .runtime import trace_holder
 
 
@@ -37,27 +37,18 @@ def review_local(repo_dir: str, diff: str, *, run_id: str = "local") -> ReviewRe
         with SqliteSaver.from_conn_string(":memory:") as cp:
             app = build_graph().compile(checkpointer=cp)
             state: ReviewState = app.invoke(
-                {
-                    "run_id": run_id,
-                    "owner": "local",
-                    "repo": "fixture",
-                    "number": 0,
-                    "dry_run": True,
-                    "head_sha": "local",
-                    "diff": diff,
-                    "workspace": workspace,
-                    "corpus": [{"source": "diff", "text": diff}],
-                    "status": "running",
-                    "started_at": t0,
-                    "iterations": 0,
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "messages": [],
-                    "findings": [],
-                    "budget_breach": None,
-                    "error": None,
-                    "posted": False,
-                },
+                fresh_state(
+                    run_id=run_id,
+                    owner="local",
+                    repo="fixture",
+                    number=0,
+                    dry_run=True,
+                    head_sha="local",
+                    diff=diff,
+                    workspace=workspace,
+                    corpus=[{"source": "diff", "text": diff}],
+                    started_at=t0,
+                ),
                 config={
                     "configurable": {"thread_id": run_id},
                     "recursion_limit": RECURSION_LIMIT,

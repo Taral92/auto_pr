@@ -27,7 +27,7 @@ from gh import (
     too_large_payload,
 )
 from .graph import RECURSION_LIMIT, build_graph
-from .graph_state import ReviewState
+from .graph_state import ReviewState, fresh_state
 from .nodes import system_prompt
 from .runtime import run_id_var, trace_holder
 
@@ -150,28 +150,23 @@ def review_pr(
         with SqliteSaver.from_conn_string(str(db)) as saver:
             saver.setup()
             app = build_graph().compile(checkpointer=saver)
+            # `thread_id` stays `run_id`, so one run keeps one checkpoint
+            # lineage - but the worker reuses that id for every attempt, and
+            # anything this input did not name survived from the attempt that
+            # failed. `fresh_state` names every field; see its docstring.
             final: ReviewState = app.invoke(
-                {
-                    "run_id": run_id,
-                    "owner": owner,
-                    "repo": repo,
-                    "number": number,
-                    "dry_run": dry_run,
-                    "head_sha": head_sha,
-                    "diff": diff,
-                    "workspace": tmp,
-                    "corpus": [{"source": "diff", "text": diff}],
-                    "status": "running",
-                    "started_at": t0,
-                    "iterations": 0,
-                    "tokens_in": 0,
-                    "tokens_out": 0,
-                    "messages": [],
-                    "findings": [],
-                    "budget_breach": None,
-                    "error": None,
-                    "posted": False,
-                },
+                fresh_state(
+                    run_id=run_id,
+                    owner=owner,
+                    repo=repo,
+                    number=number,
+                    dry_run=dry_run,
+                    head_sha=head_sha,
+                    diff=diff,
+                    workspace=tmp,
+                    corpus=[{"source": "diff", "text": diff}],
+                    started_at=t0,
+                ),
                 config={
                     "configurable": {"thread_id": run_id},
                     "recursion_limit": RECURSION_LIMIT,
