@@ -23,6 +23,9 @@ class RunSummary(BaseModel):
     state: str
     attempts: int = 0
     error: str | None = None
+    # Why a degraded run was cut short. Additive and optional, so every
+    # existing consumer of this model is unaffected.
+    degraded_reason: str | None = None
     installation_id: int | None = None
     prompt_sha: str | None = None
     model: str | None = None

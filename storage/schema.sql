@@ -37,7 +37,18 @@ CREATE TABLE IF NOT EXISTS runs (
                                       -- instead of being re-claimed at once
     worker_id          TEXT,
     cancel             BOOLEAN     NOT NULL DEFAULT FALSE,
-    error              TEXT,
+    error              TEXT,       -- TRANSIENT: the failure currently being
+                                   -- retried, cleared once it is resolved.
+    degraded_reason    TEXT,       -- DURABLE: why the review was cut short
+                                   -- (budget_breach:tokens, submit_failed:...).
+                                   -- Two columns because `error` alone carried
+                                   -- both meanings and they have opposite
+                                   -- lifetimes: closing out a post cleared the
+                                   -- transient error and took the degradation
+                                   -- reason with it, and a post retry
+                                   -- overwrote the reason before that. Written
+                                   -- only when the run is degraded, so an
+                                   -- ordinary failure never reads as one.
 
     prompt_sha         TEXT,
     model              TEXT,
@@ -94,3 +105,24 @@ CREATE INDEX IF NOT EXISTS idx_findings_run ON findings (run_id);
 
 -- Idempotent migration for databases created before delayed retries existed.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
+-- ...and before a degraded review kept its reason past the post.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS degraded_reason TEXT;
+
+-- Backfill: on a database written by the old code, a degraded run that had not
+-- yet been closed out still has its reason in `error`, where that code left it.
+-- Move it across so the deploy does not strand those rows.
+--
+-- Idempotent three times over, because this runs on every boot: the predicate
+-- stops matching once the column is populated, `degraded_reason IS NULL` means
+-- an already-populated value is never overwritten, and `state = 'degraded'`
+-- means an error on a failed or published run is never promoted into a
+-- degradation reason - which would claim something the run never did.
+--
+-- Not recoverable, and not attempted: a legacy degraded run whose post already
+-- completed had `error` set to NULL by the old `mark_posted`. That reason is
+-- gone from the database and nothing here can invent it.
+UPDATE runs
+   SET degraded_reason = error
+ WHERE state = 'degraded'
+   AND degraded_reason IS NULL
+   AND error IS NOT NULL;
