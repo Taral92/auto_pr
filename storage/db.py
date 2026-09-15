@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 from config import get_settings
 
 SCHEMA = (Path(__file__).with_name("schema.sql")).read_text()
+SCHEMA_LOCK_NAME = "auto-pr-schema-bootstrap"
 
 _pool: ConnectionPool | None = None
 
@@ -42,7 +43,15 @@ def close_pool() -> None:
 
 def init_db() -> None:
     with pool().connection() as conn:
-        conn.execute(SCHEMA)
+        # API and worker boot independently and both call this function.  The
+        # schema is idempotent, but concurrent ALTER TABLE statements can still
+        # deadlock.  Hold a session lock across the entire bootstrap so the
+        # second process waits for the first instead of racing it.
+        conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (SCHEMA_LOCK_NAME,))
+        try:
+            conn.execute(SCHEMA)
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (SCHEMA_LOCK_NAME,))
 
 
 def health() -> dict:
