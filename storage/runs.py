@@ -216,12 +216,20 @@ def reap_exhausted(*, max_attempts: int) -> list[str]:
 
     Only expired leases are touched: a row whose worker is alive and
     heartbeating has `leased_until` in the future and is left alone.
+
+    Connection loss is translated exactly as in `claim`: this runs on the same
+    line of the worker loop, inside the same `except TransientError`, so an
+    untranslated OperationalError here kills the worker just as surely - and
+    this statement runs FIRST, before the claim ever gets its turn.
     """
-    with pool().connection() as conn:
-        rows = conn.execute(
-            REAP_SQL,
-            {"error": ATTEMPTS_EXHAUSTED, "max_attempts": max_attempts},
-        ).fetchall()
+    try:
+        with pool().connection() as conn:
+            rows = conn.execute(
+                REAP_SQL,
+                {"error": ATTEMPTS_EXHAUSTED, "max_attempts": max_attempts},
+            ).fetchall()
+    except psycopg.OperationalError as e:
+        raise TransientError(f"reap: database connection lost: {e}") from None
     return [r["id"] for r in rows]
 
 

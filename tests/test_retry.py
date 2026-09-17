@@ -617,3 +617,33 @@ def test_a_db_blip_in_the_reaper_does_not_kill_the_worker(monkeypatch):
         W._stop.clear()
 
     assert calls["n"] >= 2   # it came back for a second pass
+
+
+def test_reap_exhausted_translates_a_dropped_connection(monkeypatch):
+    """The reaper must raise what the worker's handler catches.
+
+    The test above stubs the store and proves the loop survives a
+    TransientError. This proves the REAL reaper produces one - the gap that
+    let a raw psycopg.OperationalError out of `reap_exhausted` and kill a
+    live worker mid-poll, exactly as `claim` documents and guards against.
+    """
+    from contextlib import contextmanager
+
+    import psycopg
+
+    from storage import runs as R
+
+    class _Conn:
+        def execute(self, *a, **k):
+            raise psycopg.OperationalError(
+                "consuming input failed: SSL error: unexpected eof while reading")
+
+    class _Pool:
+        @contextmanager
+        def connection(self):
+            yield _Conn()
+
+    monkeypatch.setattr(R, "pool", lambda: _Pool())
+
+    with pytest.raises(TransientError, match="reap: database connection lost"):
+        R.reap_exhausted(max_attempts=3)

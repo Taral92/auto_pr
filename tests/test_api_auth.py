@@ -59,6 +59,23 @@ def _no_db(monkeypatch):
                             lambda *a, **k: pytest.fail(f"R.{name} reached"))
 
 
+@pytest.fixture(autouse=True)
+def _no_developer_dotenv(monkeypatch):
+    """Settings must not inherit the real .env.
+
+    `_client(..., None)` unsets the OPERATOR_SECRET *variable*, but Settings
+    also reads the .env FILE - which .env.example tells operators to fill in.
+    On a configured machine the fail-closed cases then return 401 instead of
+    503, so these tests would pass in CI (no .env) and fail locally. Cut the
+    file out and supply the one setting that has no default.
+    """
+    monkeypatch.setitem(config.Settings.model_config, "env_file", None)
+    monkeypatch.setenv("GITHUB_TOKEN", "pat-for-tests")
+    config.get_settings.cache_clear()
+    yield
+    config.get_settings.cache_clear()
+
+
 def _client(monkeypatch, secret: str | None):
     if secret is None:
         monkeypatch.delenv("OPERATOR_SECRET", raising=False)
