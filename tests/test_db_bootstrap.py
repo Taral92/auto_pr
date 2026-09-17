@@ -40,6 +40,38 @@ def test_schema_bootstrap_is_serialized_with_an_advisory_lock(monkeypatch):
     ]
 
 
+def test_the_pool_validates_connections_before_handing_them_out(monkeypatch):
+    """A pooler that closes idle connections leaves dead ones in the pool.
+
+    Without `check`, the first caller after a quiet period always eats
+    "SSL error: unexpected eof while reading" - observed as a 500 from
+    /healthz and a burnt worker attempt, once per idle period.
+    """
+    import config
+    from psycopg_pool import ConnectionPool
+
+    # `github_token` has no default, so building Settings needs it present.
+    # Supplied here rather than inherited from a .env, which CI has not got.
+    monkeypatch.setenv("GITHUB_TOKEN", "pat-for-tests")
+    config.get_settings.cache_clear()
+
+    seen = {}
+
+    class _FakePool:
+        # the real attribute, so db.pool() reads what production reads
+        check_connection = ConnectionPool.check_connection
+
+        def __init__(self, conninfo, **kw):
+            seen.update(kw)
+
+    monkeypatch.setattr(db, "ConnectionPool", _FakePool)
+    monkeypatch.setattr(db, "_pool", None)
+    db.pool()
+
+    assert seen["check"] is ConnectionPool.check_connection
+    config.get_settings.cache_clear()
+
+
 def test_schema_bootstrap_releases_its_lock_when_schema_setup_fails(monkeypatch):
     conn = _Connection(fail_schema=True)
     monkeypatch.setattr(db, "pool", lambda: _Pool(conn))
