@@ -47,7 +47,13 @@ def test_the_pool_validates_connections_before_handing_them_out(monkeypatch):
     "SSL error: unexpected eof while reading" - observed as a 500 from
     /healthz and a burnt worker attempt, once per idle period.
     """
+    import config
     from psycopg_pool import ConnectionPool
+
+    # `github_token` has no default, so building Settings needs it present.
+    # Supplied here rather than inherited from a .env, which CI has not got.
+    monkeypatch.setenv("GITHUB_TOKEN", "pat-for-tests")
+    config.get_settings.cache_clear()
 
     seen = {}
 
@@ -63,6 +69,7 @@ def test_the_pool_validates_connections_before_handing_them_out(monkeypatch):
     db.pool()
 
     assert seen["check"] is ConnectionPool.check_connection
+    config.get_settings.cache_clear()
 
 
 def test_schema_bootstrap_releases_its_lock_when_schema_setup_fails(monkeypatch):
