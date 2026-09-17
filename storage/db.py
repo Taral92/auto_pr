@@ -29,6 +29,15 @@ def pool() -> ConnectionPool:
                 "autocommit": True,
                 "prepare_threshold": None,
             },
+            # Validate a connection before handing it out. A pooler that closes
+            # idle connections - Supabase does - leaves dead ones in the pool,
+            # and without this the first caller after a quiet period always
+            # eats "SSL error: unexpected eof while reading". That surfaced as
+            # a 500 from /healthz and as a failed attempt in the worker, one
+            # per idle period. `check` discards and replaces the connection
+            # instead. Call sites still translate OperationalError: a
+            # connection can also die mid-query, which no check can prevent.
+            check=ConnectionPool.check_connection,
             open=True,
         )
     return _pool

@@ -49,39 +49,94 @@ Prompt caching needs no configuration on the OpenAI path — it is implicit abov
 count toward the token budget: a cached token is cheaper, but it still occupies
 the context window and is re-sent on every turn.
 
-## Local
+## Run it locally
+
+### 1. Configure
 
 ```bash
-docker compose up -d db
-cp .env.example .env          # OPENAI_API_KEY and GITHUB_TOKEN at minimum
-pip install -r requirements.txt
-
-uvicorn api.main:app --port 8000
-python -m worker.main
-
-# expose the webhook to GitHub during development
-npx smee-client --url https://smee.io/<channel> --target http://localhost:8000/webhook
+cp .env.example .env
 ```
 
-Or the whole stack: `docker compose up --build`
+| Key | Notes |
+|---|---|
+| `OPENAI_API_KEY` | required |
+| `GITHUB_APP_ID` | required |
+| `GITHUB_APP_PRIVATE_KEY` | `base64 -i key.pem \| tr -d '\n'` |
+| `GITHUB_WEBHOOK_SECRET` | must match the App's webhook secret |
+| `OPERATOR_SECRET` | `openssl rand -hex 24`. Unset means `/api/*` answers 503 |
+| `GITHUB_TOKEN` | PAT, used by the CLI only |
+| `DATABASE_URL` | used as written; see below |
 
-## GitHub App setup
+### 2. Start
 
-1. Create an App. Permissions: **Contents: Read**, **Pull requests: Read & write**.
-   Events: **Pull request**.
-2. Webhook URL → your `/webhook`. Set a webhook secret.
-3. Download the private key, then:
-   `base64 -i key.pem | tr -d '\n'` → `GITHUB_APP_PRIVATE_KEY`
-4. Install it on a repo. Open a PR.
+```bash
+docker compose up -d --build
+docker compose logs -f worker      # wait for: up; lease=900s
+```
+
+To use the bundled Postgres instead of whatever `DATABASE_URL` points at:
+
+```bash
+DATABASE_URL=postgresql://autopr:autopr@db:5432/autopr docker compose up -d --build
+```
+
+Do not run `uvicorn` on the host while the stack is up. It binds
+`127.0.0.1:8000`, which beats Docker's `*:8000` for `localhost`, and every
+webhook silently goes to it instead.
+
+### 3. Expose the webhook
+
+```bash
+ngrok http 8000
+```
+
+Set the App's **Webhook URL** to `https://<id>.ngrok-free.dev/webhook`.
+
+### 4. Verify
+
+```bash
+curl -s localhost:8000/healthz
+
+docker compose logs api | grep "POST /webhook"   # 202 accepted · 401 secret mismatch
+
+SECRET=$(grep '^OPERATOR_SECRET=' .env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $SECRET" localhost:8000/api/runs
+curl -s -H "Authorization: Bearer $SECRET" localhost:8000/api/runs/<run_id>
+```
+
+A finished run reads `published ... posted=True` in the worker log.
+`grounded` / `ungrounded` / `near` / `dropped` on the run say whether findings
+were made, filtered, or never proposed.
+
+## Tests
+
+```bash
+pytest -q
+python -m evals.runner
+```
 
 ## CLI
+
+Runs the worker's code path against one PR. `--dry-run` posts nothing.
 
 ```bash
 python -m agent.cli review https://github.com/owner/repo/pull/1 --dry-run
 ```
 
-Uses a PAT (`GITHUB_TOKEN`). Same code path as the worker — `review_pr()`
-takes either a token string or a token provider.
+Uses a PAT (`GITHUB_TOKEN`), which must have **Pull requests: Read & write** to
+post. Webhook-queued runs use an App installation token instead.
+
+## GitHub App setup
+
+1. Permissions: **Contents: Read**, **Pull requests: Read & write**.
+   Events: **Pull request**.
+2. Webhook URL → your public `/webhook`. Set a webhook secret and put the same
+   value in `GITHUB_WEBHOOK_SECRET`.
+3. `base64 -i key.pem | tr -d '\n'` → `GITHUB_APP_PRIVATE_KEY`
+4. Install it on a repo.
+
+Reviews fire on `opened`, `synchronize` and `reopened`. Drafts and
+bot-authored PRs are ignored.
 
 ## Layout
 
