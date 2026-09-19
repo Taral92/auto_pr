@@ -163,7 +163,11 @@ Grounded and in the diff → inline comment. Grounded but elsewhere → summary.
 Otherwise dropped.
 
 **Coalescing.** On a new push, queued runs for that PR are superseded and
-running ones cancelled. Cost scales with pull requests, not with pushes.
+running ones cancelled. Cost scales with pull requests, not with pushes. The
+insert and both retirements are one transaction behind a per-PR advisory lock,
+so two pushes landing together still produce one review no matter how many
+processes serve webhooks — the pool is autocommit, so that transaction is
+explicit and load-bearing.
 
 **Idempotency.** A hidden marker keyed on `(repo, pr, head_sha)` goes in the
 review body. Redelivery finds it and skips. `prompt_sha` is deliberately *not*
