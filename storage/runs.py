@@ -30,14 +30,17 @@ stuck row. Ownership changes when another worker CLAIMS, and that is exactly
 when `worker_id` changes.
 
 Four mutations are deliberately NOT fenced, because they exist to act on rows
-this worker does not own: `insert_queued`, `coalesce_pr` (the webhook cancelling
-someone else's in-flight run), `reap_exhausted` (closing out rows whose worker
-is gone) and `set_cancel` (the operator API). `claim` itself establishes
+this worker does not own: `insert_queued`, `enqueue_coalesced` (the webhook
+cancelling someone else's in-flight run), `coalesce_pr` (the same retirement
+without the insert, kept for the operator path and the tests that pin the
+old two-transaction behaviour), `reap_exhausted` (closing out rows whose
+worker is gone) and `set_cancel` (the operator API). `claim` itself establishes
 ownership and carries its own predicate.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -150,6 +153,115 @@ def coalesce_pr(owner: str, repo: str, pr_number: int, head_sha: str | None) -> 
             (owner, repo, pr_number, head_sha),
         ).fetchall()
     return {"superseded": len(superseded), "cancelled": len(cancelled)}
+
+
+def _pr_lock_key(owner: str, repo: str, pr_number: int) -> int:
+    """A stable signed 64-bit advisory-lock key for one pull request.
+
+    Hashed in Python rather than with `hashtext`, which is an undocumented
+    internal whose value is not promised to be stable across major versions.
+    """
+    digest = hashlib.blake2b(
+        f"{owner}/{repo}#{pr_number}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def enqueue_coalesced(
+    *,
+    pr_url: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    dry_run: bool = False,
+    installation_id: int | None = None,
+    delivery_id: str | None = None,
+    head_sha: str | None = None,
+) -> tuple[str | None, dict]:
+    """Retire stale work for this PR and queue the new head, atomically.
+
+    The webhook used to call `coalesce_pr` and then `insert_queued` as two
+    separate transactions, which is correct only while exactly one process
+    serves webhooks. Two near-simultaneous pushes can interleave as
+
+        coalesce(A), coalesce(B), insert(A), insert(B)
+
+    where B's coalesce finds nothing because A has not landed yet, and A's
+    insert lands afterwards. Both rows end up `queued`, the PR is reviewed
+    twice, and one of those reviews is against a stale SHA - the exact
+    outcome coalescing exists to prevent.
+
+    Today the API is a single uvicorn process making blocking psycopg calls
+    from an async handler, so the two requests serialize and the window never
+    opens. That is a property of the deployment, not of this code, and it
+    disappears the moment the API runs with `--workers 2` or a second replica.
+
+    So the ordering is inverted - insert first, then retire everything else -
+    and all three statements run in ONE transaction behind an advisory lock on
+    the pull request. Concurrent deliveries for the same PR queue up on that
+    lock and apply one at a time; deliveries for different PRs never contend.
+    The last delivery to acquire the lock is the one left `queued`, which is
+    the same "newest push wins" rule as before, now decided by a single
+    serialized point rather than by whichever statement happened to land first.
+
+    The explicit `conn.transaction()` is load-bearing and not decoration. The
+    pool hands out `autocommit=True` connections, so without it every
+    statement here would be its own transaction: `pg_advisory_xact_lock` would
+    release on the very next statement instead of at commit, and the insert
+    and the two retirements would be three independent writes - which is the
+    bug this function exists to remove, reintroduced one layer down. `init_db`
+    sidesteps the same property by taking a session-level lock and releasing
+    it by hand.
+    """
+    run_id = str(uuid.uuid4())
+    with pool().connection() as conn, conn.transaction():
+        # Held until this transaction commits, so the insert and the two
+        # retirements below are indivisible with respect to other deliveries.
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (_pr_lock_key(owner, repo, pr_number),),
+        )
+        row = conn.execute(
+            """
+            INSERT INTO runs (id, pr_url, owner, repo, pr_number, dry_run,
+                              installation_id, delivery_id, head_sha, state)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'queued')
+            ON CONFLICT (delivery_id) DO NOTHING
+            RETURNING id
+            """,
+            (run_id, pr_url, owner, repo, pr_number, dry_run,
+             installation_id, delivery_id, head_sha),
+        ).fetchone()
+        # A redelivery of an accepted delivery must not retire the work it
+        # originally scheduled, so nothing below runs when the insert was a
+        # no-op. This is why the ON CONFLICT check has to come first.
+        if row is None:
+            return None, {"superseded": 0, "cancelled": 0}
+        superseded = conn.execute(
+            """
+            UPDATE runs SET state='superseded', finished_at=now()
+             WHERE owner=%s AND repo=%s AND pr_number=%s
+               AND state='queued'
+               AND id <> %s
+               AND (head_sha IS DISTINCT FROM %s)
+            RETURNING id
+            """,
+            (owner, repo, pr_number, row["id"], head_sha),
+        ).fetchall()
+        # Unfenced on purpose, exactly as in `coalesce_pr`: cancelling an
+        # in-flight review means acting on a row another worker owns. The flag
+        # lets that worker decide how its own run ends.
+        cancelled = conn.execute(
+            """
+            UPDATE runs SET cancel=TRUE
+             WHERE owner=%s AND repo=%s AND pr_number=%s
+               AND state='running'
+               AND (head_sha IS DISTINCT FROM %s)
+            RETURNING id
+            """,
+            (owner, repo, pr_number, head_sha),
+        ).fetchall()
+    return row["id"], {"superseded": len(superseded), "cancelled": len(cancelled)}
 
 
 def claim(*, lease_s: int, worker_id: str, max_attempts: int) -> dict | None:

@@ -54,7 +54,7 @@ def _no_db(monkeypatch):
     would otherwise hang or error instead of failing the assertion."""
     for name in ("list_runs", "get_run", "findings_for", "insert_queued",
                  "set_cancel", "upsert_installation", "suspend_installation",
-                 "coalesce_pr"):
+                 "coalesce_pr", "enqueue_coalesced"):
         monkeypatch.setattr(routes.R, name,
                             lambda *a, **k: pytest.fail(f"R.{name} reached"))
 

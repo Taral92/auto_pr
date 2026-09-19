@@ -82,11 +82,10 @@ async def webhook(request: Request) -> Response:
     number = pr["number"]
     head_sha = (pr.get("head") or {}).get("sha")
 
-    # Coalesce BEFORE inserting: kill stale work for this PR, then queue the
-    # new head. A branch pushed five times gets reviewed once.
-    R.coalesce_pr(owner, name, number, head_sha)
-
-    run_id = R.insert_queued(
+    # Queue the new head and retire stale work for this PR in ONE transaction.
+    # A branch pushed five times gets reviewed once, and that stays true when
+    # more than one process serves webhooks - see `enqueue_coalesced`.
+    run_id, _ = R.enqueue_coalesced(
         pr_url=pr["html_url"],
         owner=owner,
         repo=name,
