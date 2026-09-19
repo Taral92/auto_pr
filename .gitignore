@@ -23,3 +23,6 @@ agent/claude.md
 .cursor/
 .DS_Store
 .fuse_hidden*
+
+# local planning notes
+/TASKS.md
